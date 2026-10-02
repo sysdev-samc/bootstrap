@@ -146,79 +146,6 @@ base() {
 
   systemctl enable --now cron
 
-  [ -f ~/.vimrc ] && cp ~/.vimrc ~/.vimrc.bak.$(date +%F)
-  mkdir -p ~/.vim/undo
-
-  cat >> ~/.vimrc <<'EOF'
-
-" --- Base ---------------------------------------------------
-set nocompatible              " Mode Vim pur (pas de compatibilité vi)
-set encoding=utf-8            " Encodage interne UTF-8
-set hidden                    " Permet de changer de buffer sans sauvegarder
-set mouse=                    " Souris désactivée (la sélection du terminal reste utilisable)
-
-" --- Affichage ----------------------------------------------
-set relativenumber            " Numéros relatifs : la ligne du curseur affiche 0
-set cursorline                " Surligne la ligne courante
-set scrolloff=5               " Garde 5 lignes de contexte autour du curseur
-set showcmd                   " Affiche la commande en cours de frappe
-set ruler                     " Position du curseur en bas à droite
-set laststatus=2              " Barre d'état toujours visible
-set wildmenu                  " Complétion améliorée en mode commande
-
-" --- Couleurs et syntaxe -----------------------------------
-syntax on                     " Coloration syntaxique
-filetype plugin indent on     " Détection du type de fichier + indentation adaptée
-set t_Co=256                  " Terminal 256 couleurs
-set background=dark           " Fond sombre
-colorscheme desert            " Thème desert
-
-" --- Indentation --------------------------------------------
-set expandtab                 " Tabulation -> espaces
-set tabstop=4                 " Largeur d'affichage d'une tabulation
-set shiftwidth=4              " Largeur d'un niveau d'indentation
-set softtabstop=4             " Backspace efface 4 espaces d'un coup
-set autoindent                " Conserve l'indentation de la ligne précédente
-
-" --- Recherche ----------------------------------------------
-set incsearch                 " Recherche incrémentale (pendant la frappe)
-set hlsearch                  " Surligne les résultats
-set ignorecase                " Insensible à la casse...
-set smartcase                 " ...sauf si la recherche contient une majuscule
-nnoremap <silent> <Esc><Esc> :nohlsearch<CR>   " Double Echap = efface le surlignage
-
-" --- Copier / coller ----------------------------------------
-" Note : vim-nox est compilé SANS +clipboard, donc "+y ne marche pas.
-" On passe par xclip (sudo apt install xclip) ; sous Wayland, remplacer par wl-copy / wl-paste.
-set pastetoggle=<F2>          " F2 : mode paste (évite l'auto-indentation en collant du texte)
-vnoremap <leader>y :w !xclip -selection clipboard<CR><CR>   " \y en visuel : copie vers le presse-papier système
-nnoremap <leader>p :r !xclip -selection clipboard -o<CR>    " \p : colle le presse-papier système sous le curseur
-
-" --- Caractères spéciaux ------------------------------------
-set listchars=tab:»·,trail:·,eol:¬,nbsp:␣,extends:>,precedes:<
-nnoremap <F3> :set list!<CR>  " F3 : affiche/masque tabs, espaces de fin, fins de ligne
-nnoremap <leader>w :set wrap!<CR>   " \w : bascule le retour à la ligne
-
-" --- Sudo à l'écriture --------------------------------------
-cnoremap w!! w !sudo tee % >/dev/null<CR>:e!<CR>   " :w!! sauvegarde avec sudo (fichier ouvert sans droits)
-command! W execute 'w !sudo tee % > /dev/null' <bar> edit!   " :W fait la même chose
-
-" --- Confort ------------------------------------------------
-set undofile                  " Historique d'annulation persistant
-set undodir=~/.vim/undo//     " ...stocké ici
-set backspace=indent,eol,start " Backspace fonctionne partout
-set nobackup noswapfile       " Pas de fichiers ~ ni .swp (à retirer si tu préfères la sécurité)
-set history=1000              " Historique de commandes plus long
-set splitright splitbelow     " Les nouveaux splits s'ouvrent à droite / en bas
-set virtualedit=block   " Permet de placer le curseur au-delà de la fin des lignes en mode bloc
-
-" Revenir à la dernière position à la réouverture d'un fichier
-autocmd BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
-
-" Supprimer les espaces de fin de ligne avec F4
-nnoremap <F4> :%s/\s\+$//e<CR>:nohlsearch<CR>
-EOF
-
   # Équivalent moderne de la configuration Git du rôle, sans imposer une
   # identité : celle-ci doit rester propre à chaque utilisateur/projet.
   git config --system core.whitespace 'trailing-space,space-before-tab,indent-with-non-tab'
@@ -227,6 +154,8 @@ EOF
   git config --system alias.a add
   git config --system alias.b 'branch -vv --all'
   git config --system alias.c commit
+  git config --system alias.s status
+  git config --system alias.p push
   git config --system alias.co checkout
   git config --system alias.d diff
   git config --system alias.l 'log --branches --remotes --graph'
@@ -489,6 +418,83 @@ setw -g window-status-current-style "bg=colour${col},fg=colour16,bold"
 EOF
 }
 
+write_vim_conf() {
+  local file="$1" col="$2"
+
+  [ -f "$file" ] && cp "$file" "${file}.bak.$(date +%F)"
+  cat > "$file" <<EOF
+" --- Base ---------------------------------------------------
+set nocompatible              " Mode Vim pur (pas de compatibilité vi)
+set encoding=utf-8            " Encodage interne UTF-8
+set hidden                    " Permet de changer de buffer sans sauvegarder
+set mouse=                    " Souris désactivée (la sélection du terminal reste utilisable)
+
+" --- Affichage ----------------------------------------------
+set relativenumber            " Numéros relatifs : la ligne du curseur affiche 0
+set cursorline                " Surligne la ligne courante
+set scrolloff=5               " Garde 5 lignes de contexte autour du curseur
+set showcmd                   " Affiche la commande en cours de frappe
+set ruler                     " Position du curseur en bas à droite
+set laststatus=2              " Barre d'état toujours visible
+set wildmenu                  " Complétion améliorée en mode commande
+
+" --- Couleurs et syntaxe -----------------------------------
+syntax on                     " Coloration syntaxique
+filetype plugin indent on     " Détection du type de fichier + indentation adaptée
+set t_Co=256                  " Terminal 256 couleurs
+set background=dark           " Fond sombre
+colorscheme desert            " Thème desert
+
+" --- Indentation --------------------------------------------
+set expandtab                 " Tabulation -> espaces
+set tabstop=4                 " Largeur d'affichage d'une tabulation
+set shiftwidth=4              " Largeur d'un niveau d'indentation
+set softtabstop=4             " Backspace efface 4 espaces d'un coup
+set autoindent                " Conserve l'indentation de la ligne précédente
+
+" --- Recherche ----------------------------------------------
+set incsearch                 " Recherche incrémentale (pendant la frappe)
+set hlsearch                  " Surligne les résultats
+set ignorecase                " Insensible à la casse...
+set smartcase                 " ...sauf si la recherche contient une majuscule
+nnoremap <silent> <Esc><Esc> :nohlsearch<CR>   " Double Echap = efface le surlignage
+
+" --- Copier / coller ----------------------------------------
+" Note : vim-nox est compilé SANS +clipboard, donc "+y ne marche pas.
+" On passe par xclip (sudo apt install xclip) ; sous Wayland, remplacer par wl-copy / wl-paste.
+set pastetoggle=<F2>          " F2 : mode paste (évite l'auto-indentation en collant du texte)
+vnoremap <leader>y :w !xclip -selection clipboard<CR><CR>   " \y en visuel : copie vers le presse-papier système
+nnoremap <leader>p :r !xclip -selection clipboard -o<CR>    " \p : colle le presse-papier système sous le curseur
+
+" --- Caractères spéciaux ------------------------------------
+set listchars=tab:»·,trail:·,eol:¬,nbsp:␣,extends:>,precedes:<
+nnoremap <F3> :set list!<CR>  " F3 : affiche/masque tabs, espaces de fin, fins de ligne
+nnoremap <leader>w :set wrap!<CR>   " \w : bascule le retour à la ligne
+
+" --- Sudo à l'écriture --------------------------------------
+cnoremap w!! w !sudo tee % >/dev/null<CR>:e!<CR>   " :w!! sauvegarde avec sudo (fichier ouvert sans droits)
+command! W execute 'w !sudo tee % > /dev/null' <bar> edit!   " :W fait la même chose
+
+" --- Confort ------------------------------------------------
+set undofile                  " Historique d'annulation persistant
+set undodir=~/.vim/undo//     " ...stocké ici
+set backspace=indent,eol,start " Backspace fonctionne partout
+set nobackup noswapfile       " Pas de fichiers ~ ni .swp (à retirer si tu préfères la sécurité)
+set history=1000              " Historique de commandes plus long
+set splitright splitbelow     " Les nouveaux splits s'ouvrent à droite / en bas
+set virtualedit=block   " Permet de placer le curseur au-delà de la fin des lignes en mode bloc
+
+" Revenir à la dernière position à la réouverture d'un fichier
+autocmd BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
+
+" Supprimer les espaces de fin de ligne avec F4
+nnoremap <F4> :%s/\s\+$//e<CR>:nohlsearch<CR>
+EOF
+
+
+}
+
+
 write_starship_config() {
   local file="$1" col="$2"
   cat > "$file" <<'EOF'
@@ -606,6 +612,8 @@ step_shell() {
     home="$(get_home "$u")"
     grp="$(id -gn "$u")"
     write_tmux_conf "$home/.tmux.conf" "$col"
+    mkdir -p "$home/.vim/undo"
+    write_vim_conf "$home/.vimrc" "$col"
     install -d -o "$u" -g "$grp" -m 755 "$home/.config"
     cfg="$home/.config/starship.toml"
     write_starship_config "$cfg" "$col"
