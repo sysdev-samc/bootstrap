@@ -484,13 +484,10 @@ set history=1000              " Historique de commandes plus long
 set splitright splitbelow     " Les nouveaux splits s'ouvrent à droite / en bas
 set virtualedit=block   " Permet de placer le curseur au-delà de la fin des lignes en mode bloc
 
-" Revenir à la dernière position à la réouverture d'un fichier
-autocmd BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
-
 " Supprimer les espaces de fin de ligne avec F4
 nnoremap <F4> :%s/\s\+$//e<CR>:nohlsearch<CR>
-EOF
 
+EOF
 
 }
 
