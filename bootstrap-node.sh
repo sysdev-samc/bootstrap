@@ -130,9 +130,6 @@ check_os() {
 # -----------------------------------------------------------------------------
 # packages — base du système
 # -----------------------------------------------------------------------------
-# sudo/openssh-server : accès d'administration ; tmux/git/vim/htop/jq/rsync :
-# confort ; chrony : heure précise (etcd supporte mal les dérives d'horloge) ;
-# open-iscsi/nfs-common/cryptsetup/dmsetup : prérequis du stockage Longhorn.
 step_packages() {
   log "Installation des paquets de base"
   apt-get update -y
@@ -143,20 +140,84 @@ step_packages() {
   systemctl enable --now iscsid
 }
 
-# -----------------------------------------------------------------------------
-# base — adaptation Debian 13 du rôle Ansible roles/base
-# -----------------------------------------------------------------------------
-# Le rôle source cible Debian 7 à 10 : certains paquets (python-pip,
-# bsdmainutils, iptraf...) n'existent plus ou ont été renommés. On installe donc
-# seulement les paquets présents dans les dépôts activés, sans faire échouer le
-# bootstrap pour un ancien nom de paquet. Les réglages SSH non sûrs du rôle
-# (StrictHostKeyChecking no) et son hash de mot de passe root ne sont pas repris.
 base() {
   local pkg tmp bashrc marker_begin marker_end key value editor_bin candidate
   local -a requested available
 
   systemctl enable --now cron
 
+  [ -f ~/.vimrc ] && cp ~/.vimrc ~/.vimrc.bak.$(date +%F)
+  mkdir -p ~/.vim/undo
+
+  cat >> ~/.vimrc <<'EOF'
+
+" --- Base ---------------------------------------------------
+set nocompatible              " Mode Vim pur (pas de compatibilité vi)
+set encoding=utf-8            " Encodage interne UTF-8
+set hidden                    " Permet de changer de buffer sans sauvegarder
+set mouse=                    " Souris désactivée (la sélection du terminal reste utilisable)
+
+" --- Affichage ----------------------------------------------
+set relativenumber            " Numéros relatifs : la ligne du curseur affiche 0
+set cursorline                " Surligne la ligne courante
+set scrolloff=5               " Garde 5 lignes de contexte autour du curseur
+set showcmd                   " Affiche la commande en cours de frappe
+set ruler                     " Position du curseur en bas à droite
+set laststatus=2              " Barre d'état toujours visible
+set wildmenu                  " Complétion améliorée en mode commande
+
+" --- Couleurs et syntaxe -----------------------------------
+syntax on                     " Coloration syntaxique
+filetype plugin indent on     " Détection du type de fichier + indentation adaptée
+set t_Co=256                  " Terminal 256 couleurs
+set background=dark           " Fond sombre
+colorscheme desert            " Thème desert
+
+" --- Indentation --------------------------------------------
+set expandtab                 " Tabulation -> espaces
+set tabstop=4                 " Largeur d'affichage d'une tabulation
+set shiftwidth=4              " Largeur d'un niveau d'indentation
+set softtabstop=4             " Backspace efface 4 espaces d'un coup
+set autoindent                " Conserve l'indentation de la ligne précédente
+
+" --- Recherche ----------------------------------------------
+set incsearch                 " Recherche incrémentale (pendant la frappe)
+set hlsearch                  " Surligne les résultats
+set ignorecase                " Insensible à la casse...
+set smartcase                 " ...sauf si la recherche contient une majuscule
+nnoremap <silent> <Esc><Esc> :nohlsearch<CR>   " Double Echap = efface le surlignage
+
+" --- Copier / coller ----------------------------------------
+" Note : vim-nox est compilé SANS +clipboard, donc "+y ne marche pas.
+" On passe par xclip (sudo apt install xclip) ; sous Wayland, remplacer par wl-copy / wl-paste.
+set pastetoggle=<F2>          " F2 : mode paste (évite l'auto-indentation en collant du texte)
+vnoremap <leader>y :w !xclip -selection clipboard<CR><CR>   " \y en visuel : copie vers le presse-papier système
+nnoremap <leader>p :r !xclip -selection clipboard -o<CR>    " \p : colle le presse-papier système sous le curseur
+
+" --- Caractères spéciaux ------------------------------------
+set listchars=tab:»·,trail:·,eol:¬,nbsp:␣,extends:>,precedes:<
+nnoremap <F3> :set list!<CR>  " F3 : affiche/masque tabs, espaces de fin, fins de ligne
+nnoremap <leader>w :set wrap!<CR>   " \w : bascule le retour à la ligne
+
+" --- Sudo à l'écriture --------------------------------------
+cnoremap w!! w !sudo tee % >/dev/null<CR>:e!<CR>   " :w!! sauvegarde avec sudo (fichier ouvert sans droits)
+command! W execute 'w !sudo tee % > /dev/null' <bar> edit!   " :W fait la même chose
+
+" --- Confort ------------------------------------------------
+set undofile                  " Historique d'annulation persistant
+set undodir=~/.vim/undo//     " ...stocké ici
+set backspace=indent,eol,start " Backspace fonctionne partout
+set nobackup noswapfile       " Pas de fichiers ~ ni .swp (à retirer si tu préfères la sécurité)
+set history=1000              " Historique de commandes plus long
+set splitright splitbelow     " Les nouveaux splits s'ouvrent à droite / en bas
+set virtualedit=block   " Permet de placer le curseur au-delà de la fin des lignes en mode bloc
+
+" Revenir à la dernière position à la réouverture d'un fichier
+autocmd BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
+
+" Supprimer les espaces de fin de ligne avec F4
+nnoremap <F4> :%s/\s\+$//e<CR>:nohlsearch<CR>
+EOF
 
   # Équivalent moderne de la configuration Git du rôle, sans imposer une
   # identité : celle-ci doit rester propre à chaque utilisateur/projet.
@@ -178,9 +239,6 @@ base() {
     warn "BASE_GIT_CREDENTIAL_CACHE_TIMEOUT doit être un entier positif ou 0 ; cache Git non configuré."
   fi
 
-  # Éditeur, pager et services du rôle base.
-  # /usr/bin/vim est souvent un lien qui n'est pas enregistré tel quel dans
-  # l'alternative editor ; on sélectionne sa cible réelle enregistrée.
   editor_bin=""
   for candidate in "$(readlink -f "$(command -v vim 2>/dev/null || true)")" \
     /usr/bin/vim.basic /usr/bin/vim.nox /usr/bin/vim.tiny; do
@@ -210,9 +268,6 @@ base() {
 # -----------------------------------------------------------------------------
 # dev — environnement interactif de développement pour un utilisateur
 # -----------------------------------------------------------------------------
-# Cette étape est volontairement séparée de « all » : un nœud Kubernetes n'a pas
-# nécessairement besoin de runtimes de développement. Dev Containers s'utilise
-# ensuite depuis VS Code avec Docker déjà installé par l'étape « docker ».
 dev() {
   local home grp devrc bashrc tmp
   require_dev_user
@@ -335,9 +390,6 @@ step_user() {
 # -----------------------------------------------------------------------------
 # ssh — durcissement de sshd
 # -----------------------------------------------------------------------------
-# Le fichier est nommé 00-... : Debian lit /etc/ssh/sshd_config.d/*.conf EN PREMIER
-# et, pour sshd, la première valeur rencontrée gagne. Ainsi aucun autre fichier
-# (ex: cloud-init) ne peut réactiver le mot de passe.
 step_ssh() {
   if [ "$HARDEN_SSH" != "1" ]; then
     log "Durcissement SSH ignoré (HARDEN_SSH=0)"
