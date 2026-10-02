@@ -135,7 +135,7 @@ step_packages() {
   apt-get update -y
   apt-get install -y sudo openssh-server curl ca-certificates gnupg tmux git vim-nox \
     htop jq rsync chrony bash-completion open-iscsi nfs-common cryptsetup dmsetup \
-    thefuck command-not-found curl ca-certificates most apt-file 
+    thefuck command-not-found most apt-file xclip xsel wl-clipboard ncurses-term 
   systemctl enable --now chrony
   systemctl enable --now iscsid
 }
@@ -381,9 +381,15 @@ write_tmux_conf() {
   local file="$1" col="$2"
   cat > "$file" <<EOF
 # ~/.tmux.conf — géré par bootstrap-node.sh
-set -g default-terminal "screen-256color"
-set -ga terminal-overrides ",*256col*:Tc"
-set -g history-limit 50000
+
+# Terminal et couleurs TrueColor (palette pastel)
+set -g default-terminal "tmux-256color"
+set -as terminal-features ",xterm*:RGB:clipboard"
+set -as terminal-features ",screen*:RGB:clipboard"
+set -as terminal-features ",tmux*:RGB:clipboard"
+
+# Général
+set -g history-limit 100000
 set -g mouse on
 set -g base-index 1
 setw -g pane-base-index 1
@@ -392,10 +398,16 @@ set -sg escape-time 10
 set -g focus-events on
 setw -g mode-keys vi
 
-# Recharger la config : prefix + r
-bind r source-file ~/.tmux.conf \\; display "tmux.conf rechargé"
+# Presse-papiers : OSC 52 pour copier depuis une session SSH vers le terminal local
+set -s set-clipboard external
+bind -T copy-mode-vi v send -X begin-selection
+bind -T copy-mode-vi y send -X copy-selection-and-cancel
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel
 
-# Découpages plus intuitifs, dans le dossier courant
+# Recharger la configuration : prefix + r
+bind r source-file ~/.tmux.conf \\; display-message "tmux.conf rechargé"
+
+# Découpages intuitifs, dans le dossier courant
 bind | split-window -h -c "#{pane_current_path}"
 bind - split-window -v -c "#{pane_current_path}"
 bind c new-window -c "#{pane_current_path}"
@@ -406,15 +418,46 @@ bind -n M-Right select-pane -R
 bind -n M-Up select-pane -U
 bind -n M-Down select-pane -D
 
-# Barre d'état : le nom de la machine a sa couleur, pour ne pas se tromper de nœud
+# Palette pastel sombre inspirée de Catppuccin
+# Fond #1e1e2e ; surface #313244 ; texte #cdd6f4
+# Bleu #89b4fa ; cyan #89dceb ; vert #a6e3a1
+# Jaune #f9e2af ; rose #f5c2e7 ; mauve #cba6f7
+
+# Barre d'état avec hôte, charge système, date et heure
+set -g status on
+set -g status-position bottom
 set -g status-interval 5
-set -g status-style "bg=colour235,fg=colour250"
-set -g status-left-length 30
-set -g status-left "#[bg=colour${col},fg=colour16,bold] #H #[default] "
-set -g status-right "#[fg=colour245]load #(cut -d' ' -f1-3 /proc/loadavg)  #[fg=colour250]%d/%m %H:%M "
-setw -g window-status-format " #I:#W "
-setw -g window-status-current-format " #I:#W "
-setw -g window-status-current-style "bg=colour${col},fg=colour16,bold"
+set -g status-style "bg=#1e1e2e,fg=#cdd6f4"
+set -g status-left-length 40
+set -g status-left "#[bg=colour${col},fg=colour235,bold] #H #[default] "
+set -g status-right-length 100
+set -g status-right "#[fg=#cba6f7]%d/%m/%Y #[fg=#6c7086]│ #[fg=#89dceb,bold]%H:%M "
+
+# Fenêtres
+setw -g window-status-separator ""
+setw -g window-status-format "#[fg=#a6adc8,bg=#1e1e2e] #I:#W "
+setw -g window-status-current-format "#[fg=#f5c2e7,bg=#313244,bold] #I:#W "
+
+# Bordures et messages
+set -g pane-border-style "fg=#45475a"
+set -g pane-active-border-style "fg=#89b4fa"
+set -g message-style "bg=#313244,fg=#cdd6f4"
+setw -g mode-style "bg=#45475a,fg=#f5e0dc"
+
+# Plugins gérés par TPM
+set -g @plugin 'tmux-plugins/tpm'
+set -g @plugin 'tmux-plugins/tmux-resurrect'
+set -g @plugin 'tmux-plugins/tmux-continuum'
+
+# Resurrect : inclure le contenu visible des panes dans la sauvegarde
+set -g @resurrect-capture-pane-contents 'on'
+
+# Continuum : sauvegarde toutes les 5 minutes et restauration automatique
+set -g @continuum-save-interval '5'
+set -g @continuum-restore 'on'
+
+# TPM doit rester à la fin du fichier
+run '~/.tmux/plugins/tpm/tpm'
 EOF
 }
 
@@ -592,6 +635,33 @@ fi
 EOF
 }
 
+
+install_tmux_plugins() {
+  local target_user="$1" home="$2" tpm_dir="$home/.tmux/plugins/tpm" grp
+  grp="$(id -gn "$target_user")"
+
+  install -d -o "$target_user" -g "$grp" -m 755 "$home/.tmux/plugins"
+
+  if [ ! -d "$tpm_dir/.git" ]; then
+    log "Installation de TPM pour $target_user"
+    sudo -u "$target_user" env HOME="$home" \
+      git clone https://github.com/tmux-plugins/tpm "$tpm_dir"
+  else
+    log "TPM existe déjà pour $target_user"
+  fi
+
+  # Le script TPM lit ~/.tmux.conf et installe les plugins déclarés.
+  if [ -x "$tpm_dir/bin/install_plugins" ]; then
+    log "Installation des plugins tmux pour $target_user"
+    sudo -u "$target_user" env HOME="$home" \
+      "$tpm_dir/bin/install_plugins"
+  else
+    warn "Le script TPM install_plugins est absent pour $target_user."
+  fi
+
+  chown -R "$target_user:$grp" "$home/.tmux"
+}
+
 step_shell() {
   require_admin_user
   local idx col u home grp cfg
@@ -608,7 +678,12 @@ step_shell() {
   for u in "$ADMIN_USER" root; do
     home="$(get_home "$u")"
     grp="$(id -gn "$u")"
+    # Préserver la configuration existante avant de la remplacer.
+    if [ -f "$home/.tmux.conf" ] && ! grep -qF 'géré par bootstrap-node.sh' "$home/.tmux.conf"; then
+      cp -a "$home/.tmux.conf" "$home/.tmux.conf.bak.$(date +%Y%m%d-%H%M%S)"
+    fi
     write_tmux_conf "$home/.tmux.conf" "$col"
+    install_tmux_plugins "$u" "$home"
     mkdir -p "$home/.vim/undo"
     write_vim_conf "$home/.vimrc" "$col"
     install -d -o "$u" -g "$grp" -m 755 "$home/.config"
