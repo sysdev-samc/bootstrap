@@ -53,7 +53,7 @@
 #   K3S_TLS_SAN         nom ou IP stable pour joindre l'API (DNS, IP virtuelle...)
 #                       -> permet de piloter le cluster sans dépendre de l'IP de A
 #   CONTROL_PLANE_ONLY  1 = ce serveur ne reçoit aucun pod applicatif (machine C)
-#   ETCD_ONLY           1 = machine C ne fait tourner QUE etcd (ni API, ni scheduler,
+#                1 = machine C ne fait tourner QUE etcd (ni API, ni scheduler,
 #                       ni controller-manager) : recommandé pour un Raspberry Pi 3
 #                       (1 Go de RAM). Implique CONTROL_PLANE_ONLY. Pas de kubectl
 #                       sur cette machine : le contrôle se fait depuis A ou B.
