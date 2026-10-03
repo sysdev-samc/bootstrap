@@ -402,7 +402,7 @@ setw -g mode-keys vi
 set -s set-clipboard external
 bind -T copy-mode-vi v send -X begin-selection
 bind -T copy-mode-vi y send -X copy-selection-and-cancel
-bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel \\; display-message "Copié"
 
 # Recharger la configuration : prefix + r
 bind r source-file ~/.tmux.conf \\; display-message "tmux.conf rechargé"
