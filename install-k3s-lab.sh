@@ -36,6 +36,14 @@
 #       ./install-k3s-lab.sh status      (vérifie etcd, nœuds et snapshots)
 #   Worker supplémentaire éventuel : ... ./install-k3s-lab.sh agent
 #
+#   Disque NVMe dédié à /var/lib/rancher (recommandé pour les membres etcd) :
+#       sudo RANCHER_DEVICE=/dev/nvme0n1 ETCD_ONLY=1 K3S_URL=... K3S_TOKEN=... \
+#            ./install-k3s-lab.sh server-join
+#       Le disque est partitionné, formaté en ext4 et monté AVANT l'installation de
+#       k3s. Étape seule : sudo RANCHER_DEVICE=/dev/nvme0n1 ./install-k3s-lab.sh nvme
+#   kubectl en couleur (kubecolor), alias k et complétion : installés
+#       automatiquement sur les serveurs. Relance seule : ./install-k3s-lab.sh kubectl-setup
+#
 # PORTS À OUVRIR ENTRE LES MACHINES (si pare-feu actif)
 #   6443/tcp        API Kubernetes
 #   2379-2380/tcp   etcd (clients et réplication entre serveurs) : entre serveurs
@@ -48,12 +56,13 @@
 #   disque lent (HDD, RAID logiciel chargé) provoque des timeouts et des
 #   changements de leader. Les données etcd sont dans /var/lib/rancher/k3s/server/db :
 #   garde-les sur un SSD (disque système), pas sur un gros volume de stockage.
+#   RANCHER_DEVICE (voir plus bas) monte pour toi un NVMe sur /var/lib/rancher.
 #
 # VARIABLES OPTIONNELLES
 #   K3S_TLS_SAN         nom ou IP stable pour joindre l'API (DNS, IP virtuelle...)
 #                       -> permet de piloter le cluster sans dépendre de l'IP de A
 #   CONTROL_PLANE_ONLY  1 = ce serveur ne reçoit aucun pod applicatif (machine C)
-#                1 = machine C ne fait tourner QUE etcd (ni API, ni scheduler,
+#   ETCD_ONLY           1 = machine C ne fait tourner QUE etcd (ni API, ni scheduler,
 #                       ni controller-manager) : recommandé pour un Raspberry Pi 3
 #                       (1 Go de RAM). Implique CONTROL_PLANE_ONLY. Pas de kubectl
 #                       sur cette machine : le contrôle se fait depuis A ou B.
@@ -66,6 +75,16 @@
 #                       après la première installation)
 #   LONGHORN_DATA_PATH  dossier des données Longhorn (défaut /var/lib/longhorn)
 #   REPLICAS            nombre de copies de chaque volume (défaut 2)
+#   RANCHER_DEVICE      disque à monter sur /var/lib/rancher, ex: /dev/nvme0n1
+#                       (vide = on ne touche à aucun disque)
+#   RANCHER_FORMAT      yes = autoriser le formatage d'un disque qui contient déjà
+#                       des données (EFFACE tout). Inutile pour un disque vierge.
+#   RANCHER_MIGRATE     1 = si k3s est déjà installé, copie /var/lib/rancher vers le
+#                       nouveau disque (k3s est arrêté pendant l'opération)
+#   KUBECOLOR           1 (défaut) = installer kubecolor et aliaser kubectl/k dessus ;
+#                       0 = alias k=kubectl sans couleur
+#   SHELL_USERS         utilisateurs dont le shell est configuré pour kubectl
+#                       (défaut : l'utilisateur de sudo et root)
 # =============================================================================
 
 set -euo pipefail
@@ -80,6 +99,11 @@ ETCD_RELAXED_TIMEOUTS="${ETCD_RELAXED_TIMEOUTS:-0}"
 LONGHORN_VERSION="${LONGHORN_VERSION:-}"
 LONGHORN_DATA_PATH="${LONGHORN_DATA_PATH:-/var/lib/longhorn}"
 REPLICAS="${REPLICAS:-2}"
+RANCHER_DEVICE="${RANCHER_DEVICE:-}"
+RANCHER_FORMAT="${RANCHER_FORMAT:-no}"
+RANCHER_MIGRATE="${RANCHER_MIGRATE:-0}"
+KUBECOLOR="${KUBECOLOR:-1}"
+SHELL_USERS="${SHELL_USERS:-}"
 KUBECONFIG_PATH="/etc/rancher/k3s/k3s.yaml"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -212,8 +236,7 @@ install_k3s_server() {
   fi
 
   log "Attente que le nœud soit prêt"
-  local i
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     if k3s kubectl get nodes >/dev/null 2>&1; then break; fi
     sleep 3
   done
@@ -237,15 +260,235 @@ setup_kubeconfig() {
 }
 
 # -----------------------------------------------------------------------------
+# Disque dédié à /var/lib/rancher (NVMe) — étape « nvme »
+# -----------------------------------------------------------------------------
+# /var/lib/rancher contient TOUT l'état de k3s : base etcd, certificats, images
+# containerd. Sur un nœud etcd il doit être sur un disque rapide (SSD/NVMe), pas
+# sur l'eMMC ou la carte SD que les écritures d'etcd useraient.
+#
+# Actif quand RANCHER_DEVICE est défini (ex: /dev/nvme0n1). Le script :
+#   1. crée une partition GPT unique et la formate en ext4 (étiquette « rancher »),
+#      sauf si ce disque a déjà été préparé par ce script (il est alors réutilisé) ;
+#   2. ajoute l'entrée /etc/fstab par UUID, avec « nofail » : la machine démarre
+#      même si le disque est absent ;
+#   3. pose une dépendance systemd (RequiresMountsFor) : k3s REFUSE de démarrer si
+#      le disque n'est pas monté, au lieu de démarrer avec une base vide sur l'eMMC ;
+#   4. active fstrim.timer (nettoyage périodique du SSD).
+#
+# SÉCURITÉ : le formatage EFFACE le disque. Si /dev/... contient déjà des données
+# (partition ou système de fichiers non préparé par ce script), il faut confirmer
+# avec RANCHER_FORMAT=yes. Un disque monté (système, /home...) est toujours refusé.
+setup_rancher_disk() {
+  [ -n "$RANCHER_DEVICE" ] || return 0
+  need_root
+  local dev="$RANCHER_DEVICE" mnt="/var/lib/rancher" part uuid ts tmpm svc
+
+  [ -b "$dev" ] || die "RANCHER_DEVICE : $dev n'est pas un périphérique bloc."
+
+  if mountpoint -q "$mnt"; then
+    log "$mnt est déjà un point de montage ($(findmnt -no SOURCE "$mnt")) : rien à formater."
+  else
+    # Disque déjà préparé par ce script ? (partition étiquetée « rancher »)
+    part="$(lsblk -lnpo NAME,LABEL "$dev" | awk '$2=="rancher"{print $1; exit}')"
+
+    if [ -z "$part" ]; then
+      if lsblk -lnpo MOUNTPOINT "$dev" | grep -q .; then
+        die "$dev (ou une de ses partitions) est monté : refus de le formater."
+      fi
+      if blkid -p "$dev" >/dev/null 2>&1 || [ "$(lsblk -lnpo TYPE "$dev" | grep -c part)" -gt 0 ]; then
+        [ "$RANCHER_FORMAT" = "yes" ] \
+          || die "$dev contient déjà des données ou une table de partitions. Vérifie avec 'lsblk -f', puis relance avec RANCHER_FORMAT=yes pour l'EFFACER."
+      fi
+      log "Partitionnement de $dev (GPT, 1 partition) puis formatage ext4"
+      printf 'label: gpt\n,,L\n' | sfdisk --quiet --wipe always --wipe-partitions always "$dev"
+      blockdev --rereadpt "$dev" 2>/dev/null || true
+      udevadm settle 2>/dev/null || sleep 2
+      # Attente (jusqu'à 10 s) que le noyau crée le fichier de la nouvelle partition
+      part=""
+      for _ in $(seq 1 20); do
+        part="$(lsblk -lnpo NAME,TYPE "$dev" | awk '$2=="part"{print $1; exit}')"
+        if [ -n "$part" ] && [ -b "$part" ]; then break; fi
+        sleep 0.5
+      done
+      { [ -n "$part" ] && [ -b "$part" ]; } || die "Partition créée introuvable sur $dev."
+      mkfs.ext4 -q -m 1 -L rancher "$part"
+    else
+      log "Partition $part déjà préparée (étiquette rancher) : réutilisée."
+    fi
+
+    uuid="$(blkid -s UUID -o value "$part")"
+    [ -n "$uuid" ] || die "UUID de $part introuvable."
+
+    if grep -qE "[[:space:]]${mnt}[[:space:]]" /etc/fstab; then
+      grep -qF "$uuid" /etc/fstab \
+        || die "/etc/fstab contient déjà une entrée pour $mnt avec un autre UUID : corrige-la à la main."
+    else
+      printf 'UUID=%s %s ext4 defaults,noatime,nofail,x-systemd.device-timeout=10s 0 2\n' "$uuid" "$mnt" >> /etc/fstab
+      log "Entrée ajoutée à /etc/fstab"
+    fi
+
+    mkdir -p "$mnt"
+    # Données déjà présentes sur l'ancien disque (k3s déjà installé) : migration
+    if [ -n "$(ls -A "$mnt" 2>/dev/null)" ]; then
+      [ "$RANCHER_MIGRATE" = "1" ] \
+        || die "$mnt n'est pas vide (k3s déjà installé ?). Relance avec RANCHER_MIGRATE=1 pour copier les données sur le nouveau disque."
+      command -v rsync >/dev/null 2>&1 || die "rsync est requis pour la migration (apt install rsync)."
+      log "Migration des données de $mnt vers $part (k3s arrêté)"
+      for svc in k3s k3s-agent; do
+        systemctl stop "$svc" 2>/dev/null || true
+      done
+      tmpm="$(mktemp -d)"
+      mount "$part" "$tmpm"
+      rsync -aHAX "$mnt/" "$tmpm/"
+      umount "$tmpm"
+      rmdir "$tmpm"
+      ts="$(date +%Y%m%d%H%M%S)"
+      mv "$mnt" "$mnt.old-$ts"
+      mkdir -p "$mnt"
+      log "Anciennes données conservées dans $mnt.old-$ts : supprime-les après vérification."
+    fi
+
+    systemctl daemon-reload
+    mount "$mnt"
+  fi
+
+  mountpoint -q "$mnt" || die "$mnt n'est pas monté : abandon."
+  findmnt "$mnt"
+
+  # k3s ne démarre que si le disque est monté
+  for svc in k3s k3s-agent; do
+    mkdir -p "/etc/systemd/system/${svc}.service.d"
+    printf '[Unit]\nRequiresMountsFor=%s\n' "$mnt" > "/etc/systemd/system/${svc}.service.d/10-rancher-mount.conf"
+  done
+  systemctl daemon-reload
+  systemctl enable --now fstrim.timer 2>/dev/null || warn "fstrim.timer indisponible."
+}
+
+# -----------------------------------------------------------------------------
+# kubectl : couleur (kubecolor), alias k et complétion automatique
+# -----------------------------------------------------------------------------
+# kubecolor appelle kubectl et colorise sa sortie. Il est installé depuis le
+# paquet .deb officiel du projet (amd64 ou arm64).
+#
+# POURQUOI LA COMPLÉTION DISPARAÎT AVEC UN ALIAS : bash attache la complétion au
+# NOM de la commande. kubectl a la sienne (fonction __start_kubectl), mais pas
+# « kubecolor » ni l'alias « k ». On leur rattache donc explicitement la même
+# fonction avec « complete -o default -F __start_kubectl ... », APRÈS avoir chargé
+# la complétion de kubectl.
+install_kubecolor() {
+  if command -v kubecolor >/dev/null 2>&1; then
+    return 0
+  fi
+  local arch ver deb tmp
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64|arm64) ;;
+    *) warn "kubecolor : pas de paquet .deb pour l'architecture $arch."; return 1 ;;
+  esac
+  log "Installation de kubecolor"
+  ver="$(curl -fsSL https://kubecolor.github.io/packages/deb/version | tr -d '[:space:]')" \
+    || { warn "kubecolor : version introuvable (réseau ?)."; return 1; }
+  deb="kubecolor_${ver}_${arch}.deb"
+  tmp="$(mktemp -d)"
+  if curl -fsSL "https://kubecolor.github.io/packages/deb/pool/main/k/kubecolor/${deb}" -o "$tmp/$deb" \
+     && dpkg -i "$tmp/$deb"; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  rm -rf "$tmp"
+  warn "kubecolor : installation impossible, kubectl reste sans couleur."
+  return 1
+}
+
+# Écrit ~/.bash_kubectl : alias + complétion (chargé depuis ~/.bashrc)
+write_kubectl_shell() {
+  local file="$1" color="$2"
+  {
+    echo "# ~/.bash_kubectl — kubectl : couleur, alias k, complétion (géré par install-k3s-lab.sh)"
+    echo "LAB_KUBECOLOR=${color}"
+  } > "$file"
+  cat >> "$file" <<'EOF'
+
+[[ $- == *i* ]] || return 0
+
+if command -v kubectl >/dev/null 2>&1; then
+  # Charge bash-completion si ce shell ne l'a pas fait (le .bashrc de root, par ex.)
+  if ! type _init_completion >/dev/null 2>&1 && [ -f /usr/share/bash-completion/bash_completion ]; then
+    . /usr/share/bash-completion/bash_completion
+  fi
+  # Fonction __start_kubectl (déjà fournie par /etc/bash_completion.d/kubectl si présent)
+  if ! type __start_kubectl >/dev/null 2>&1; then
+    source <(kubectl completion bash 2>/dev/null)
+  fi
+
+  if [ "${LAB_KUBECOLOR:-1}" = "1" ] && command -v kubecolor >/dev/null 2>&1; then
+    alias kubectl=kubecolor
+    alias k=kubecolor
+    complete -o default -F __start_kubectl kubecolor
+  else
+    alias k=kubectl
+  fi
+  complete -o default -F __start_kubectl kubectl
+  complete -o default -F __start_kubectl k
+fi
+EOF
+}
+
+setup_kubectl_shell() {
+  need_root
+  if ! command -v kubectl >/dev/null 2>&1; then
+    warn "kubectl introuvable : k3s est-il installé sur cette machine ?"
+    return 0
+  fi
+  local users u home grp tmp
+  if [ "$KUBECOLOR" = "1" ]; then
+    install_kubecolor || true
+  fi
+
+  # Complétion système (fichier statique : démarrage de shell plus rapide)
+  tmp="$(mktemp)"
+  if kubectl completion bash > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mkdir -p /etc/bash_completion.d
+    install -m 644 "$tmp" /etc/bash_completion.d/kubectl
+  fi
+  rm -f "$tmp"
+
+  users="${SHELL_USERS:-}"
+  if [ -z "$users" ]; then
+    users="root"
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      users="$SUDO_USER root"
+    fi
+  fi
+  for u in $users; do
+    if ! id "$u" >/dev/null 2>&1; then
+      warn "Utilisateur inconnu pour la config kubectl : $u"
+      continue
+    fi
+    home="$(getent passwd "$u" | cut -d: -f6)"
+    grp="$(id -gn "$u")"
+    write_kubectl_shell "$home/.bash_kubectl" "$KUBECOLOR"
+    touch "$home/.bashrc"
+    if ! grep -qF '.bash_kubectl' "$home/.bashrc"; then
+      printf '\n# kubectl : couleur, alias k, complétion\n[ -f "$HOME/.bash_kubectl" ] && . "$HOME/.bash_kubectl"\n' >> "$home/.bashrc"
+    fi
+    chown "$u:$grp" "$home/.bash_kubectl" "$home/.bashrc"
+  done
+  log "kubectl : alias k et complétion configurés (ouvre un nouveau shell ou : source ~/.bashrc)"
+}
+
+# -----------------------------------------------------------------------------
 # ÉTAPE 2 — Premier serveur (machine A) : crée le cluster etcd
 # -----------------------------------------------------------------------------
 server() {
   need_root
   prereqs
+  setup_rancher_disk
   log "Installation du 1er serveur k3s (etcd embarqué)"
   write_k3s_config init
   install_k3s_server
   setup_kubeconfig
+  setup_kubectl_shell
 
   local ip
   ip="$(hostname -I | awk '{print $1}')"
@@ -273,11 +516,13 @@ server_join() {
   [ -n "$K3S_URL" ] || die "K3S_URL manquant (ex: https://192.168.1.10:6443)"
   [ -n "$K3S_TOKEN" ] || die "K3S_TOKEN manquant (cf. sortie de la commande 'server')"
   prereqs
+  setup_rancher_disk
   log "Ajout de ce serveur au cluster (membre etcd + control plane)"
   write_k3s_config join
   install_k3s_server
   if [ "$ETCD_ONLY" != "1" ]; then
     setup_kubeconfig
+    setup_kubectl_shell
   fi
   log "Serveur ajouté. Vérifie l'état : ./install-k3s-lab.sh status"
 }
@@ -290,6 +535,7 @@ agent() {
   [ -n "$K3S_URL" ] || die "K3S_URL manquant"
   [ -n "$K3S_TOKEN" ] || die "K3S_TOKEN manquant"
   prereqs
+  setup_rancher_disk
   log "Installation d'un agent k3s"
   local -a envs=("INSTALL_K3S_EXEC=agent" "K3S_URL=$K3S_URL" "K3S_TOKEN=$K3S_TOKEN")
   if [ -n "$K3S_VERSION" ]; then
@@ -446,11 +692,17 @@ case "${1:-}" in
   server)      server ;;
   server-join) server_join ;;
   agent)       agent ;;
+  nvme)
+    need_root
+    [ -n "$RANCHER_DEVICE" ] || die "RANCHER_DEVICE manquant (ex: sudo RANCHER_DEVICE=/dev/nvme0n1 $0 nvme)"
+    setup_rancher_disk
+    ;;
+  kubectl-setup) setup_kubectl_shell ;;
   longhorn)    longhorn ;;
   test)        test_replication ;;
   status)      status ;;
   *)
-    echo "Usage: $0 {prereqs|server|server-join|agent|longhorn|test|status}"
+    echo "Usage: $0 {prereqs|server|server-join|agent|nvme|kubectl-setup|longhorn|test|status}"
     echo "Voir l'en-tête du script pour le détail des étapes."
     exit 1
     ;;
