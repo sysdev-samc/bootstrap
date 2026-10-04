@@ -41,8 +41,9 @@
 #            ./install-k3s-lab.sh server-join
 #       Le disque est partitionné, formaté en ext4 et monté AVANT l'installation de
 #       k3s. Étape seule : sudo RANCHER_DEVICE=/dev/nvme0n1 ./install-k3s-lab.sh nvme
-#   kubectl en couleur (kubecolor), alias k et complétion : installés
-#       automatiquement sur les serveurs. Relance seule : ./install-k3s-lab.sh kubectl-setup
+#   kubectl en couleur (kubecolor), alias k et kns, complétion, namespace courant
+#       dans le prompt (kube-ps1) : installés automatiquement sur les serveurs.
+#       Relance seule : sudo ./install-k3s-lab.sh kubectl-setup
 #
 # PORTS À OUVRIR ENTRE LES MACHINES (si pare-feu actif)
 #   6443/tcp        API Kubernetes
@@ -83,6 +84,9 @@
 #                       nouveau disque (k3s est arrêté pendant l'opération)
 #   KUBECOLOR           1 (défaut) = installer kubecolor et aliaser kubectl/k dessus ;
 #                       0 = alias k=kubectl sans couleur
+#   KUBE_PS1            1 (défaut) = installer kube-ps1 et afficher le namespace
+#                       courant dans le prompt ; 0 = prompt inchangé
+#   KUBE_PS1_VERSION    version de kube-ps1 à installer (défaut : v1.0.0)
 #   SHELL_USERS         utilisateurs dont le shell est configuré pour kubectl
 #                       (défaut : l'utilisateur de sudo et root)
 # =============================================================================
@@ -103,6 +107,9 @@ RANCHER_DEVICE="${RANCHER_DEVICE:-}"
 RANCHER_FORMAT="${RANCHER_FORMAT:-no}"
 RANCHER_MIGRATE="${RANCHER_MIGRATE:-0}"
 KUBECOLOR="${KUBECOLOR:-1}"
+KUBE_PS1="${KUBE_PS1:-1}"
+KUBE_PS1_VERSION="${KUBE_PS1_VERSION:-v1.0.0}"
+KUBE_PS1_DIR="/usr/local/share/kube-ps1"
 SHELL_USERS="${SHELL_USERS:-}"
 KUBECONFIG_PATH="/etc/rancher/k3s/k3s.yaml"
 
@@ -401,12 +408,41 @@ install_kubecolor() {
   return 1
 }
 
-# Écrit ~/.bash_kubectl : alias + complétion (chargé depuis ~/.bashrc)
+# kube-ps1 (github.com/jonmosco/kube-ps1) affiche le contexte et le namespace
+# courants dans le prompt. Il n'est pas packagé dans Debian : c'est un seul
+# script shell, téléchargé dans une version fixée (KUBE_PS1_VERSION) pour que
+# tous les nœuds aient le même. Il ne relance kubectl que si le kubeconfig a été
+# modifié (par kubens, par exemple) : le prompt reste instantané.
+install_kube_ps1() {
+  if [ -r "$KUBE_PS1_DIR/kube-ps1.sh" ] \
+     && [ "$(cat "$KUBE_PS1_DIR/VERSION" 2>/dev/null)" = "$KUBE_PS1_VERSION" ]; then
+    return 0
+  fi
+  local tmp
+  log "Installation de kube-ps1 ${KUBE_PS1_VERSION}"
+  tmp="$(mktemp)"
+  if curl -fsSL "https://raw.githubusercontent.com/jonmosco/kube-ps1/${KUBE_PS1_VERSION}/kube-ps1.sh" -o "$tmp" \
+     && [ -s "$tmp" ]; then
+    mkdir -p "$KUBE_PS1_DIR"
+    install -m 644 "$tmp" "$KUBE_PS1_DIR/kube-ps1.sh"
+    echo "$KUBE_PS1_VERSION" > "$KUBE_PS1_DIR/VERSION"
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "kube-ps1 : téléchargement impossible, le prompt reste inchangé."
+  return 1
+}
+
+# Écrit ~/.bash_kubectl : alias (k, kns), complétion et prompt (chargé depuis ~/.bashrc)
 write_kubectl_shell() {
-  local file="$1" color="$2"
+  local file="$1" color="$2" ps1="${3:-0}"
   {
-    echo "# ~/.bash_kubectl — kubectl : couleur, alias k, complétion (géré par install-k3s-lab.sh)"
+    echo "# ~/.bash_kubectl — kubectl : couleur, alias k/kns, complétion, prompt (géré par install-k3s-lab.sh)"
     echo "LAB_KUBECOLOR=${color}"
+    echo "LAB_KUBE_PS1=${ps1}"
+    echo "LAB_KUBE_PS1_SCRIPT=${KUBE_PS1_DIR}/kube-ps1.sh"
+    echo "LAB_K3S_KUBECONFIG=${KUBECONFIG_PATH}"
   } > "$file"
   cat >> "$file" <<'EOF'
 
@@ -446,6 +482,49 @@ if command -v kubectl >/dev/null 2>&1; then
   complete -o default -F __start_kubectl kubectl
   complete -o default -F __start_kubectl k
 fi
+
+# kns = kubens (changer de namespace par défaut). bash-completion ne charge la
+# complétion qu'à la demande, d'après le nom de la commande : « kns » n'a pas de
+# fichier, on charge donc celui de kubens puis on le rattache à l'alias.
+if command -v kubens >/dev/null 2>&1; then
+  alias kns=kubens
+  if ! type _kube_namespaces >/dev/null 2>&1 && [ -f /usr/share/bash-completion/completions/kubens.bash ]; then
+    . /usr/share/bash-completion/completions/kubens.bash
+  fi
+  if type _kube_namespaces >/dev/null 2>&1; then
+    complete -F _kube_namespaces kns
+  fi
+fi
+
+# Prompt : namespace courant via kube-ps1, ex. « (⎈|kube-system) user@hôte:~$ »
+# Réglages modifiables en les définissant dans ~/.bashrc AVANT la ligne qui
+# charge ce fichier (voir les variables KUBE_PS1_* de kube-ps1). Désactivation
+# temporaire : kubeoff ; réactivation : kubeon.
+if [ "${LAB_KUBE_PS1:-0}" = "1" ] && [ -r "$LAB_KUBE_PS1_SCRIPT" ] && command -v kubectl >/dev/null 2>&1; then
+  # kube-ps1 ne relit la config que si le fichier kubeconfig change, et doit donc
+  # le trouver. root n'a pas de ~/.kube/config : kubectl (k3s) lit alors
+  # /etc/rancher/k3s/k3s.yaml, on l'indique explicitement.
+  if [ -z "${KUBECONFIG:-}" ] && [ ! -r "$HOME/.kube/config" ] && [ -r "$LAB_K3S_KUBECONFIG" ]; then
+    export KUBECONFIG="$LAB_K3S_KUBECONFIG"
+  fi
+  # Le vrai binaire, pas la fonction kubectl ci-dessus (kubecolor) : pas de
+  # codes couleur dans le prompt.
+  KUBE_PS1_BINARY="$(type -P kubectl)"
+  # k3s n'a qu'un contexte, nommé « default » : on n'affiche que le namespace.
+  # Avec plusieurs clusters (kubectx) : KUBE_PS1_CONTEXT_ENABLE=true.
+  : "${KUBE_PS1_CONTEXT_ENABLE:=false}"
+  : "${KUBE_PS1_SEPARATOR:=|}"
+  # Sans namespace enregistré, kubectl utilise « default » : on l'affiche.
+  __lab_kube_ps1_ns() {
+    if [ "$1" = "N/A" ]; then echo default; else echo "$1"; fi
+  }
+  : "${KUBE_PS1_NAMESPACE_FUNCTION:=__lab_kube_ps1_ns}"
+  . "$LAB_KUBE_PS1_SCRIPT"
+  case "$PS1" in
+    *kube_ps1*) ;;
+    *) PS1='$(kube_ps1) '"$PS1" ;;
+  esac
+fi
 EOF
 }
 
@@ -458,6 +537,10 @@ setup_kubectl_shell() {
   local users u home grp tmp
   if [ "$KUBECOLOR" = "1" ]; then
     install_kubecolor || true
+  fi
+  local ps1=0
+  if [ "$KUBE_PS1" = "1" ] && install_kube_ps1; then
+    ps1=1
   fi
 
   # Complétion système (fichier statique : démarrage de shell plus rapide)
@@ -482,14 +565,14 @@ setup_kubectl_shell() {
     fi
     home="$(getent passwd "$u" | cut -d: -f6)"
     grp="$(id -gn "$u")"
-    write_kubectl_shell "$home/.bash_kubectl" "$KUBECOLOR"
+    write_kubectl_shell "$home/.bash_kubectl" "$KUBECOLOR" "$ps1"
     touch "$home/.bashrc"
     if ! grep -qF '.bash_kubectl' "$home/.bashrc"; then
-      printf '\n# kubectl : couleur, alias k, complétion\n[ -f "$HOME/.bash_kubectl" ] && . "$HOME/.bash_kubectl"\n' >> "$home/.bashrc"
+      printf '\n# kubectl : couleur, alias k/kns, complétion, prompt\n[ -f "$HOME/.bash_kubectl" ] && . "$HOME/.bash_kubectl"\n' >> "$home/.bashrc"
     fi
     chown "$u:$grp" "$home/.bash_kubectl" "$home/.bashrc"
   done
-  log "kubectl : alias k et complétion configurés (ouvre un nouveau shell ou : source ~/.bashrc)"
+  log "kubectl : alias k/kns, complétion et prompt configurés (ouvre un nouveau shell ou : source ~/.bashrc)"
 }
 
 # -----------------------------------------------------------------------------
