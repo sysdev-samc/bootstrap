@@ -120,13 +120,14 @@ need_root() {
 # Longhorn expose chaque volume au pod via iSCSI : il faut donc open-iscsi
 # (le démon iscsid) sur chaque nœud. nfs-common permet les volumes partagés
 # (RWX) et les sauvegardes vers un NFS. cryptsetup/dmsetup servent au
-# chiffrement et à la gestion des périphériques de bloc.
+# chiffrement et à la gestion des périphériques de bloc. kubectx fournit
+# kubectx (changer de contexte) et kubens (changer de namespace par défaut).
 # (Installés aussi sur la machine C : inoffensif, et pratique si elle change de rôle.)
 prereqs() {
   need_root
-  log "Installation des paquets requis (open-iscsi, nfs-common, ...)"
+  log "Installation des paquets requis (open-iscsi, nfs-common, kubectx, ...)"
   apt-get update -y
-  apt-get install -y open-iscsi nfs-common cryptsetup dmsetup curl ca-certificates
+  apt-get install -y open-iscsi nfs-common cryptsetup dmsetup curl ca-certificates kubectx
 
   log "Activation du démon iSCSI"
   systemctl enable --now iscsid
