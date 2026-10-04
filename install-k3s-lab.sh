@@ -411,6 +411,9 @@ write_kubectl_shell() {
 
 [[ $- == *i* ]] || return 0
 
+# Retire d'éventuels alias k/kubectl : un alias empêche de définir une fonction du même nom
+unalias k kubectl 2>/dev/null || true
+
 if command -v kubectl >/dev/null 2>&1; then
   # Charge bash-completion si ce shell ne l'a pas fait (le .bashrc de root, par ex.)
   if ! type _init_completion >/dev/null 2>&1 && [ -f /usr/share/bash-completion/bash_completion ]; then
@@ -422,9 +425,20 @@ if command -v kubectl >/dev/null 2>&1; then
   fi
 
   if [ "${LAB_KUBECOLOR:-1}" = "1" ] && command -v kubecolor >/dev/null 2>&1; then
-    alias kubectl=kubecolor
-    alias k=kubecolor
-    complete -o default -F __start_kubectl kubecolor
+    # kubecolor colorise la sortie de kubectl. Pendant la complétion, kubectl est
+    # rappelé avec « __complete » : si kubecolor colorise CETTE réponse, les codes
+    # couleur polluent le résultat et bash affiche « ((: 4 : erreur de syntaxe ».
+    # On passe donc par des fonctions (et non des alias) qui envoient la complétion
+    # directement au vrai kubectl et tout le reste à kubecolor.
+    __lab_kc() {
+      if [ "${1:-}" = "__complete" ] || [ "${1:-}" = "__completeNoDesc" ]; then
+        command kubectl "$@"
+      else
+        command kubecolor "$@"
+      fi
+    }
+    kubectl() { __lab_kc "$@"; }
+    k() { __lab_kc "$@"; }
   else
     alias k=kubectl
   fi
