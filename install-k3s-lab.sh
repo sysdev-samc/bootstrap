@@ -500,7 +500,11 @@ fi
 # Réglages modifiables en les définissant dans ~/.bashrc AVANT la ligne qui
 # charge ce fichier (voir les variables KUBE_PS1_* de kube-ps1). Désactivation
 # temporaire : kubeoff ; réactivation : kubeon.
-if [ "${LAB_KUBE_PS1:-0}" = "1" ] && [ -r "$LAB_KUBE_PS1_SCRIPT" ] && command -v kubectl >/dev/null 2>&1; then
+# Avec Starship (étape shell de bootstrap-node.sh), le prompt est reconstruit à
+# chaque commande et effacerait kube-ps1 : c'est alors le module kubernetes de
+# Starship qui affiche le contexte et le namespace.
+if [ "${LAB_KUBE_PS1:-0}" = "1" ] && [ -r "$LAB_KUBE_PS1_SCRIPT" ] && command -v kubectl >/dev/null 2>&1 \
+   && ! command -v starship >/dev/null 2>&1; then
   # kube-ps1 ne relit la config que si le fichier kubeconfig change, et doit donc
   # le trouver. root n'a pas de ~/.kube/config : kubectl (k3s) lit alors
   # /etc/rancher/k3s/k3s.yaml, on l'indique explicitement.

@@ -26,6 +26,9 @@
 #   k3s-prep   Prépare le système pour k3s : modules noyau, sysctl, swap, cgroups,
 #              pare-feu, fichier hosts.
 #   k3s        (à la demande) Lance install-k3s-lab.sh avec le bon rôle.
+#   kubectl    (à la demande, sur ton POSTE : WSL, portable) Installe kubectl
+#              (dépôt officiel Kubernetes) et kubectx, récupère le kubeconfig d'un
+#              serveur k3s par SSH, et configure alias, complétion et prompt.
 #
 # UTILISATION
 #   Tout préparer (sans installer k3s) :
@@ -40,6 +43,9 @@
 #     sudo K3S_ROLE=init  K3S_TLS_SAN=k3s.lab.local ./bootstrap-node.sh k3s    # nas1
 #     sudo K3S_ROLE=join  K3S_URL=https://IP_NAS1:6443 K3S_TOKEN=... ./bootstrap-node.sh k3s   # nas2
 #     sudo K3S_ROLE=etcd  K3S_URL=https://IP_NAS1:6443 K3S_TOKEN=... ./bootstrap-node.sh k3s   # nas3 (ARM)
+#   Piloter le cluster depuis ton poste (dans un vrai terminal : ssh et sudo
+#   peuvent demander un mot de passe) :
+#     sudo DEV_USER=$USER KUBECONFIG_SOURCE=nas1 ./bootstrap-node.sh kubectl
 #
 # VARIABLES
 #   ADMIN_USER        (obligatoire) utilisateur à créer/configurer, ex: admin
@@ -65,8 +71,16 @@
 #   ALLOW_32BIT       1 = autoriser un OS ARM 32 bits pour k3s (déconseillé)
 #   BASE_GIT_CREDENTIAL_CACHE_TIMEOUT  durée en secondes du cache Git (défaut 900,
 #                     0 = ne pas configurer le cache).
-#   DEV_USER          utilisateur à configurer à l'étape dev (défaut : ADMIN_USER,
-#                     ou l'utilisateur ayant lancé sudo).
+#   DEV_USER          utilisateur à configurer aux étapes dev et kubectl (défaut :
+#                     ADMIN_USER, ou l'utilisateur ayant lancé sudo).
+#   KUBECTL_VERSION   version mineure de kubectl, ex: v1.33 (défaut : la stable
+#                     actuelle). Garde au plus une version d'écart avec le cluster.
+#   KUBECONFIG_SOURCE serveur k3s d'où copier le kubeconfig par SSH, ex: nas1 ou
+#                     admin@192.168.1.10 (lit ~/.kube/config de l'utilisateur distant,
+#                     copié là par install-k3s-lab.sh). Vide = pas de copie.
+#   K3S_API           adresse de l'API à mettre dans ce kubeconfig, ex:
+#                     k3s.lab.local (défaut : l'adresse SSH de KUBECONFIG_SOURCE)
+#   KUBE_CONTEXT      nom du contexte kubectl créé (défaut : k3s-lab)
 # =============================================================================
 
 set -euo pipefail
@@ -90,6 +104,10 @@ K3S_ROLE="${K3S_ROLE:-}"
 ALLOW_32BIT="${ALLOW_32BIT:-0}"
 BASE_GIT_CREDENTIAL_CACHE_TIMEOUT="${BASE_GIT_CREDENTIAL_CACHE_TIMEOUT:-900}"
 DEV_USER="${DEV_USER:-${ADMIN_USER:-${SUDO_USER:-}}}"
+KUBECTL_VERSION="${KUBECTL_VERSION:-}"
+KUBECONFIG_SOURCE="${KUBECONFIG_SOURCE:-}"
+K3S_API="${K3S_API:-}"
+KUBE_CONTEXT="${KUBE_CONTEXT:-k3s-lab}"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33mATTENTION: %s\033[0m\n' "$*" >&2; }
@@ -381,70 +399,111 @@ write_tmux_conf() {
   local file="$1" col="$2"
   cat > "$file" <<EOF
 # ~/.tmux.conf — géré par bootstrap-node.sh
+# Base : configuration de la formation (tmux.conf du dépôt), complétée par les
+# réglages du lab (presse-papiers, Alt+flèches, | et -, vi, plugins).
+# En cas de conflit, la valeur de la formation est conservée.
 
-# Terminal et couleurs TrueColor (palette pastel)
+# ------------------------------------------------------------
+# Général
+# ------------------------------------------------------------
+set -g mouse on
+set -g history-limit 50000
+set -g base-index 1
+setw -g pane-base-index 1
+set -g renumber-windows on
+set -sg escape-time 0
+set -g focus-events on
+setw -g mode-keys vi
+
+# True color, et presse-papiers OSC 52 annoncé pour les terminaux courants
 set -g default-terminal "tmux-256color"
+set -as terminal-features ",xterm-256color:RGB"
 set -as terminal-features ",xterm*:RGB:clipboard"
 set -as terminal-features ",screen*:RGB:clipboard"
 set -as terminal-features ",tmux*:RGB:clipboard"
 
-# Général
-set -g history-limit 100000
-set -g mouse on
-set -g base-index 1
-setw -g pane-base-index 1
-set -g renumber-windows on
-set -sg escape-time 10
-set -g focus-events on
-setw -g mode-keys vi
+# ------------------------------------------------------------
+# Souris : la molette fait défiler l'historique (entre en mode copie)
+# ------------------------------------------------------------
+bind -n WheelUpPane if-shell -F -t = "#{mouse_any_flag}" "send-keys -M" "if -Ft= '#{pane_in_mode}' 'send-keys -M' 'select-pane -t=; copy-mode -e; send-keys -M'"
+bind -n WheelDownPane select-pane -t= \; send-keys -M
 
-# Presse-papiers : OSC 52 pour copier depuis une session SSH vers le terminal local
-set -s set-clipboard external
+# ------------------------------------------------------------
+# Presse-papiers
+# ------------------------------------------------------------
+# « on » et non « external » : tmux accepte aussi les copies faites PAR les
+# programmes du panneau (séquence OSC 52), puis les transmet au terminal. C'est
+# indispensable quand tmux est imbriqué (tmux local -> ssh -> tmux du nœud ->
+# Claude) : avec « external », le tmux local jette la copie qui remonte du nœud.
+set -s set-clipboard on
+# Les terminaux sans OSC 52 (GNOME Terminal, Terminator et autres terminaux VTE)
+# ignorent cette séquence : on écrit donc AUSSI dans le presse-papiers système
+# quand une session graphique est accessible (wl-copy, xclip, xsel ou Windows
+# sous WSL). Sur un nœud sans écran, lab-clip-copy ne fait rien.
+set -s copy-command '/usr/local/bin/lab-clip-copy'
+set-hook -g pane-set-clipboard 'run-shell -b "tmux save-buffer - | /usr/local/bin/lab-clip-copy"'
 bind -T copy-mode-vi v send -X begin-selection
-bind -T copy-mode-vi y send -X copy-selection-and-cancel
-bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel \\; display-message "Copié"
+bind -T copy-mode-vi y send -X copy-pipe-and-cancel
+bind -T copy-mode-vi Enter send -X copy-pipe-and-cancel
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \; display-message "Copié"
 
-# Recharger la configuration : prefix + r
-bind r source-file ~/.tmux.conf \\; display-message "tmux.conf rechargé"
-
-# Découpages intuitifs, dans le dossier courant
-bind | split-window -h -c "#{pane_current_path}"
-bind - split-window -v -c "#{pane_current_path}"
-bind c new-window -c "#{pane_current_path}"
-
-# Changer de panneau avec Alt + flèches
+# ------------------------------------------------------------
+# Panneaux et fenêtres
+# ------------------------------------------------------------
+# Changer de panneau : prefix + h/j/k/l, ou Alt + flèches sans prefix
+bind h select-pane -L
+bind j select-pane -D
+bind k select-pane -U
+bind l select-pane -R
 bind -n M-Left select-pane -L
 bind -n M-Right select-pane -R
 bind -n M-Up select-pane -U
 bind -n M-Down select-pane -D
 
-# Palette pastel sombre inspirée de Catppuccin
-# Fond #1e1e2e ; surface #313244 ; texte #cdd6f4
-# Bleu #89b4fa ; cyan #89dceb ; vert #a6e3a1
-# Jaune #f9e2af ; rose #f5c2e7 ; mauve #cba6f7
+# Garder le dossier courant : " et % (standard), | et - (plus intuitifs)
+bind c new-window -c "#{pane_current_path}"
+bind '"' split-window -v -c "#{pane_current_path}"
+bind % split-window -h -c "#{pane_current_path}"
+bind | split-window -h -c "#{pane_current_path}"
+bind - split-window -v -c "#{pane_current_path}"
 
-# Barre d'état avec hôte, charge système, date et heure
-set -g status on
-set -g status-position bottom
-set -g status-interval 5
-set -g status-style "bg=#1e1e2e,fg=#cdd6f4"
-set -g status-left-length 40
-set -g status-left "#[bg=colour${col},fg=colour235,bold] #H #[default] "
-set -g status-right-length 100
-set -g status-right "#[fg=#cba6f7]%d/%m/%Y #[fg=#6c7086]│ #[fg=#89dceb,bold]%H:%M "
+# Recharger la configuration : prefix + r
+bind r source-file ~/.tmux.conf \; display-message "tmux config reloaded"
 
-# Fenêtres
-setw -g window-status-separator ""
-setw -g window-status-format "#[fg=#a6adc8,bg=#1e1e2e] #I:#W "
-setw -g window-status-current-format "#[fg=#f5c2e7,bg=#313244,bold] #I:#W "
+# Nom de fenêtre = dossier courant
+setw -g automatic-rename on
+setw -g automatic-rename-format '#{b:pane_current_path}'
 
-# Bordures et messages
+# Titre en haut de chaque panneau
+set -g pane-border-status top
+set -g pane-border-format " #{pane_index} #{pane_title} "
 set -g pane-border-style "fg=#45475a"
 set -g pane-active-border-style "fg=#89b4fa"
+
+# Activité dans une autre fenêtre : marquée dans la barre, sans message
+setw -g monitor-activity on
+set -g visual-activity off
+
+# ------------------------------------------------------------
+# Barre d'état
+# ------------------------------------------------------------
+set -g status on
+set -g status-position bottom
+set -g status-interval 1
+set -g status-style bg=yellow,bold
+# Nom de la machine dans sa couleur propre, puis nom de la session
+set -g status-left-length 40
+set -g status-left "#[bg=colour${col},fg=colour235,bold] #H #[default] #S "
+set -g status-right-length 80
+set -g status-right " %Y-%m-%d %H:%M "
+setw -g window-status-format " #I:#W "
+setw -g window-status-current-format " [#I:#W] "
 set -g message-style "bg=#313244,fg=#cdd6f4"
 setw -g mode-style "bg=#45475a,fg=#f5e0dc"
 
+# ------------------------------------------------------------
 # Plugins gérés par TPM
+# ------------------------------------------------------------
 set -g @plugin 'tmux-plugins/tpm'
 set -g @plugin 'tmux-plugins/tmux-resurrect'
 set -g @plugin 'tmux-plugins/tmux-continuum'
@@ -459,6 +518,34 @@ set -g @continuum-restore 'on'
 # TPM doit rester à la fin du fichier
 run '~/.tmux/plugins/tpm/tpm'
 EOF
+}
+
+# Copie l'entrée standard dans le presse-papiers système, utilisé par tmux.
+write_clip_helper() {
+  cat > /usr/local/bin/lab-clip-copy <<'EOF'
+#!/bin/sh
+# lab-clip-copy — copie l'entrée standard dans le presse-papiers système
+# (géré par bootstrap-node.sh, appelé par tmux à chaque copie).
+# Sans session graphique (nœud en SSH), l'entrée est ignorée : tmux transmet de
+# toute façon la copie au terminal par OSC 52.
+# Les sorties sont redirigées : wl-copy et xclip restent en arrière-plan pour
+# servir le presse-papiers, et tmux attendrait sinon leur fin.
+if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then
+  exec wl-copy >/dev/null 2>&1
+elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+  exec xclip -selection clipboard >/dev/null 2>&1
+elif [ -n "${DISPLAY:-}" ] && command -v xsel >/dev/null 2>&1; then
+  exec xsel --clipboard --input >/dev/null 2>&1
+elif grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null && command -v powershell.exe >/dev/null 2>&1; then
+  # clip.exe abîme les accents : PowerShell lit l'entrée en UTF-8
+  exec powershell.exe -NoProfile -Command \
+    '[Console]::InputEncoding = [Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())' \
+    >/dev/null 2>&1
+else
+  cat >/dev/null
+fi
+EOF
+  chmod 755 /usr/local/bin/lab-clip-copy
 }
 
 write_vim_conf() {
@@ -578,7 +665,8 @@ style = 'yellow'
 
 [kubernetes]
 disabled = false
-format = '[$symbol$context]($style) '
+# Contexte, puis namespace courant (choisi avec kns) s'il est défini
+format = '[$symbol$context( \($namespace\))]($style) '
 style = 'bold cyan'
 
 [cmd_duration]
@@ -675,6 +763,7 @@ step_shell() {
   log "Configuration de tmux et du prompt Starship (couleur $col pour $(hostname))"
   apt-get update -y
   apt-get install -y starship
+  write_clip_helper
   for u in "$ADMIN_USER" root; do
     home="$(get_home "$u")"
     grp="$(id -gn "$u")"
@@ -915,6 +1004,116 @@ step_k3s() {
   esac
 }
 
+# -----------------------------------------------------------------------------
+# kubectl — piloter le cluster depuis un poste sans k3s (WSL, portable)
+# -----------------------------------------------------------------------------
+# Sur les nœuds, kubectl est fourni par k3s (/usr/local/bin/kubectl -> k3s).
+# Sur un poste, on installe le kubectl officiel, puis on récupère le kubeconfig
+# d'un serveur. Ce kubeconfig pointe vers 127.0.0.1 : on le remplace par
+# l'adresse du serveur, et on renomme « default » en KUBE_CONTEXT pour pouvoir
+# le fusionner avec d'autres clusters (kubectx pour passer de l'un à l'autre).
+install_kubectl_pkg() {
+  local minor
+  if [ "$(readlink /usr/local/bin/kubectl 2>/dev/null)" = "k3s" ]; then
+    log "k3s est installé ici : son kubectl intégré est utilisé."
+    return 0
+  fi
+  minor="${KUBECTL_VERSION:-}"
+  if [ -z "$minor" ]; then
+    minor="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" \
+      || die "Version stable de kubectl introuvable (réseau ?). Indique KUBECTL_VERSION=v1.xx."
+  fi
+  minor="v${minor#v}"
+  minor="$(echo "$minor" | cut -d. -f1,2)"
+  [[ "$minor" =~ ^v1\.[0-9]+$ ]] || die "KUBECTL_VERSION invalide : $minor (ex: v1.33)."
+
+  log "Installation de kubectl $minor (dépôt officiel pkgs.k8s.io)"
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://pkgs.k8s.io/core:/stable:/${minor}/deb/Release.key" \
+    | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  cat > /etc/apt/sources.list.d/kubernetes.sources <<EOF
+Types: deb
+URIs: https://pkgs.k8s.io/core:/stable:/${minor}/deb/
+Suites: /
+Signed-By: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+EOF
+  apt-get update -y
+  apt-get install -y kubectl
+}
+
+fetch_kubeconfig() {
+  local home grp kdir cfg new merged api host
+  home="$(get_home "$DEV_USER")"
+  grp="$(id -gn "$DEV_USER")"
+  kdir="$home/.kube"
+  cfg="$kdir/config"
+  install -d -m 700 -o "$DEV_USER" -g "$grp" "$kdir"
+
+  log "Copie du kubeconfig depuis $KUBECONFIG_SOURCE (SSH en tant que $DEV_USER)"
+  new="$(mktemp)"
+  merged="$(mktemp)"
+  # SSH lancé en tant que DEV_USER : sa clé et son ~/.ssh/config sont utilisés.
+  if ! sudo -u "$DEV_USER" env HOME="$home" \
+       ssh "$KUBECONFIG_SOURCE" 'cat ~/.kube/config' > "$new" \
+     || ! grep -q '^apiVersion:' "$new"; then
+    rm -f "$new" "$merged"
+    die "Kubeconfig introuvable sur $KUBECONFIG_SOURCE (~/.kube/config). Lance d'abord install-k3s-lab.sh sur ce serveur avec sudo."
+  fi
+
+  # Adresse de l'API : K3S_API, sinon l'adresse réelle derrière l'alias SSH
+  api="$K3S_API"
+  if [ -z "$api" ]; then
+    host="${KUBECONFIG_SOURCE#*@}"
+    api="$(sudo -u "$DEV_USER" env HOME="$home" ssh -G "$host" 2>/dev/null \
+      | awk '$1 == "hostname" { print $2; exit }' || true)"
+    api="${api:-$host}"
+  fi
+  sed -i -E "s#(server: https://)(127\.0\.0\.1|localhost)(:[0-9]+)#\1${api}\3#" "$new"
+  sed -i -E "s/^([[:space:]-]*)(name|cluster|user|current-context): default$/\1\2: ${KUBE_CONTEXT}/" "$new"
+
+  # Fusion avec un kubeconfig existant : le nouveau contexte remplace un
+  # éventuel homonyme et devient le contexte courant.
+  if [ -s "$cfg" ]; then
+    cp -a "$cfg" "$cfg.bak.$(date +%Y%m%d-%H%M%S)"
+    KUBECONFIG="$new:$cfg" kubectl config view --flatten > "$merged"
+    install -m 600 -o "$DEV_USER" -g "$grp" "$merged" "$cfg"
+  else
+    install -m 600 -o "$DEV_USER" -g "$grp" "$new" "$cfg"
+  fi
+  rm -f "$new" "$merged"
+  log "Contexte « $KUBE_CONTEXT » écrit dans $cfg (API : https://${api}:6443)"
+
+  if sudo -u "$DEV_USER" env HOME="$home" KUBECONFIG="$cfg" \
+       kubectl --context "$KUBE_CONTEXT" --request-timeout=10s get nodes; then
+    log "Le cluster répond."
+  else
+    warn "Le cluster ne répond pas. Vérifie que ${api}:6443 est joignable depuis ce poste et figure dans le certificat (K3S_TLS_SAN)."
+  fi
+}
+
+step_kubectl() {
+  require_dev_user
+  local script
+  install_kubectl_pkg
+  apt-get install -y kubectx bash-completion
+
+  if [ -n "$KUBECONFIG_SOURCE" ]; then
+    fetch_kubeconfig
+  else
+    warn "KUBECONFIG_SOURCE vide : aucun kubeconfig copié (ex: KUBECONFIG_SOURCE=nas1)."
+  fi
+
+  # Alias k/kns, complétion, kubecolor et prompt : même configuration que sur
+  # les nœuds, fournie par install-k3s-lab.sh.
+  script="$(dirname "$(readlink -f "$0")")/install-k3s-lab.sh"
+  if [ -f "$script" ]; then
+    SHELL_USERS="$DEV_USER" bash "$script" kubectl-setup
+  else
+    warn "install-k3s-lab.sh introuvable à côté de ce script : alias et complétion non configurés."
+  fi
+}
+
 summary() {
   cat <<EOF
 
@@ -960,8 +1159,9 @@ main() {
     docker)    step_docker ;;
     k3s-prep)  step_k3s_prep ;;
     k3s)       step_k3s ;;
+    kubectl)   step_kubectl ;;
     *)
-      die "Étape inconnue : $cmd (all | packages | base | dev | user | ssh | shell | docker | k3s-prep | k3s)."
+      die "Étape inconnue : $cmd (all | packages | base | dev | user | ssh | shell | docker | k3s-prep | k3s | kubectl)."
       ;;
   esac
 }
