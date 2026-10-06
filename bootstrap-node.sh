@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bootstrap-node.sh — Préparer un nœud Debian 13 (amd64 ou arm64) pour le lab
+# bootstrap-node.sh — Préparer une machine Debian 12 ou 13 (amd64) pour le lab
 # =============================================================================
 #
 # À lancer sur CHAQUE machine (nas1, nas2, nas3), en root. Le script est
 # IDEMPOTENT : tu peux le relancer sans casser ce qui est déjà en place.
 #
 # CE QU'IL FAIT
-#   packages   Paquets de base (sudo, tmux, git, chrony...) + prérequis Longhorn
-#              (open-iscsi, nfs-common). chrony synchronise l'heure : indispensable
-#              pour etcd et les certificats Kubernetes.
+#   packages   Paquets de base (sudo, git, vim, chrony...). chrony synchronise
+#              l'heure : indispensable pour etcd et les certificats Kubernetes.
 #   base       Reprend de façon compatible Debian 13 les réglages utiles du rôle
 #              Ansible base : outils d'exploitation, bash, Git, pager, cron et
 #              permissions système. Aucun mot de passe root n'est défini.
@@ -19,16 +18,25 @@
 #              installe ta clé publique SSH.
 #   ssh        Durcit sshd (root interdit, mot de passe interdit SI une clé est
 #              installée) et affiche le bloc à copier dans ton ~/.ssh/config.
-#   shell      Configure tmux et le prompt Starship (couleur propre à chaque
-#              machine, Git et Kubernetes) pour l'utilisateur et root.
+#   shell      Installe et configure tmux et le prompt Starship (couleur propre à
+#              chaque machine, Git et Kubernetes) pour l'utilisateur et root.
+#              Debian 13 : paquets natifs. Debian 12 : tmux 3.5a des backports et
+#              Starship officiel, depuis le dossier bundle (voir « download »).
 #   docker     Installe le daemon Docker (dépôt officiel, amd64 ou arm64 détecté
 #              automatiquement) avec rotation des logs.
-#   k3s-prep   Prépare le système pour k3s : modules noyau, sysctl, swap, cgroups,
-#              pare-feu, fichier hosts.
-#   k3s        (à la demande) Lance install-k3s-lab.sh avec le bon rôle.
-#   kubectl    (à la demande, sur ton POSTE : WSL, portable) Installe kubectl
-#              (dépôt officiel Kubernetes) et kubectx, récupère le kubeconfig d'un
-#              serveur k3s par SSH, et configure alias, complétion et prompt.
+#   kubectl    (à la demande) Installe kubectl, kubecolor et kubectx, installe le
+#              kubeconfig de l'utilisateur et configure alias (k, kns) et
+#              complétion. Sur un nœud k3s : kubeconfig local. Sur ton poste (WSL,
+#              portable) : kubeconfig copié par SSH depuis un serveur.
+#   download   (à la demande, sans root) Télécharge dans le dossier bundle ce qui
+#              n'est pas dans les dépôts Debian : kubectl, kubecolor, Starship,
+#              tmux 3.5a pour Debian 12, et les plugins tmux (TPM, resurrect,
+#              continuum). Les étapes shell et kubectl utilisent ce dossier
+#              s'il est rempli : copie-le avec le script sur une machine sans
+#              internet (airgap). Supprime-le pour reprendre les dernières versions.
+#
+# k3s lui-même s'installe avec install-k3s-lab.sh, qui ne touche pas à
+# l'environnement de la machine.
 #
 # UTILISATION
 #   Tout préparer (sans installer k3s) :
@@ -39,16 +47,20 @@
 #     sudo ./bootstrap-node.sh base
 #   Préparer le poste de développement de l'utilisateur admin :
 #     sudo ADMIN_USER=admin ./bootstrap-node.sh dev
-#   Installer k3s ensuite, UN nœud à la fois, dans l'ordre :
-#     sudo K3S_ROLE=init  K3S_TLS_SAN=k3s.lab.local ./bootstrap-node.sh k3s    # nas1
-#     sudo K3S_ROLE=join  K3S_URL=https://IP_NAS1:6443 K3S_TOKEN=... ./bootstrap-node.sh k3s   # nas2
-#     sudo K3S_ROLE=etcd  K3S_URL=https://IP_NAS1:6443 K3S_TOKEN=... ./bootstrap-node.sh k3s   # nas3 (ARM)
+#   Préparer les binaires sur une machine connectée (avant un airgap) :
+#     ./bootstrap-node.sh download
+#   Après install-k3s-lab.sh, sur chaque nœud k3s :
+#     sudo ADMIN_USER=admin ./bootstrap-node.sh kubectl
 #   Piloter le cluster depuis ton poste (dans un vrai terminal : ssh et sudo
 #   peuvent demander un mot de passe) :
 #     sudo DEV_USER=$USER KUBECONFIG_SOURCE=nas1 ./bootstrap-node.sh kubectl
 #
 # VARIABLES
-#   ADMIN_USER        (obligatoire) utilisateur à créer/configurer, ex: admin
+#   ADMIN_USER        utilisateur d'administration à créer/configurer, ex: admin
+#                     (défaut : l'utilisateur qui a lancé sudo). Les étapes shell
+#                     et kubectl configurent CET utilisateur ET root ; le script
+#                     refuse de continuer s'il ne sait pas quel utilisateur viser
+#                     (script lancé directement en root, sans sudo ni ADMIN_USER).
 #   SSH_PUBKEY_FILE   fichier de clé publique à autoriser
 #   SSH_PUBKEY        ou la clé publique elle-même (une ligne)
 #   SUDO_NOPASSWD     1 = sudo sans mot de passe (pratique en lab ; si la clé SSH
@@ -63,21 +75,21 @@
 #   INSTALL_DOCKER    1 (défaut) ou 0 (ex: pour économiser la RAM sur nas3)
 #   DOCKER_SOURCE     official (défaut, dépôt Docker) | debian (paquet docker.io)
 #   DOCKER_DATA_ROOT  dossier des données Docker (ext4/xfs), ex: /mnt/nvme/docker
-#   DISABLE_SWAP      1 (défaut) = désactiver le swap (recommandé pour Kubernetes)
-#   CLUSTER_CIDR      réseau du lab (ex: 192.168.1.0/24) : ouvre les ports k3s si
-#                     ufw est actif
-#   HOSTS_ENTRIES     noms des nœuds, ex: nas1=192.168.1.10,nas2=192.168.1.11,nas3=192.168.1.12
-#   K3S_ROLE          init | join | etcd | agent (étape « k3s »)
-#   ALLOW_32BIT       1 = autoriser un OS ARM 32 bits pour k3s (déconseillé)
 #   BASE_GIT_CREDENTIAL_CACHE_TIMEOUT  durée en secondes du cache Git (défaut 900,
 #                     0 = ne pas configurer le cache).
-#   DEV_USER          utilisateur à configurer aux étapes dev et kubectl (défaut :
-#                     ADMIN_USER, ou l'utilisateur ayant lancé sudo).
-#   KUBECTL_VERSION   version mineure de kubectl, ex: v1.33 (défaut : la stable
-#                     actuelle). Garde au plus une version d'écart avec le cluster.
+#   DEV_USER          utilisateur à configurer aux étapes dev et kubectl, s'il
+#                     diffère de ADMIN_USER (défaut : ADMIN_USER).
+#   BUNDLE_DIR        dossier des binaires téléchargés (défaut : bundle/ à côté
+#                     du script)
+#   KUBECTL_VERSION   version de kubectl, ex: v1.33.4 (défaut : la stable actuelle).
+#                     Garde au plus une version mineure d'écart avec le cluster.
+#   KUBECOLOR_VERSION version de kubecolor, ex: v0.8.0 (défaut : la dernière)
+#   STARSHIP_VERSION  version de Starship pour Debian 12, ex: v1.26.0 (défaut :
+#                     la dernière)
 #   KUBECONFIG_SOURCE serveur k3s d'où copier le kubeconfig par SSH, ex: nas1 ou
-#                     admin@192.168.1.10 (lit ~/.kube/config de l'utilisateur distant,
-#                     copié là par install-k3s-lab.sh). Vide = pas de copie.
+#                     admin@192.168.1.10 (lit ~/.kube/config de l'utilisateur
+#                     distant, installé là par l'étape kubectl). Vide = kubeconfig
+#                     local de k3s s'il existe.
 #   K3S_API           adresse de l'API à mettre dans ce kubeconfig, ex:
 #                     k3s.lab.local (défaut : l'adresse SSH de KUBECONFIG_SOURCE)
 #   KUBE_CONTEXT      nom du contexte kubectl créé (défaut : k3s-lab)
@@ -86,7 +98,10 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-ADMIN_USER="${ADMIN_USER:-}"
+# Utilisateur qui a lancé sudo (vide si le script est lancé directement en root)
+SUDO_REAL_USER="${SUDO_USER:-}"
+[ "$SUDO_REAL_USER" = "root" ] && SUDO_REAL_USER=""
+ADMIN_USER="${ADMIN_USER:-$SUDO_REAL_USER}"
 SSH_PUBKEY="${SSH_PUBKEY:-}"
 SSH_PUBKEY_FILE="${SSH_PUBKEY_FILE:-}"
 SUDO_NOPASSWD="${SUDO_NOPASSWD:-0}"
@@ -97,14 +112,15 @@ HOST_COLOR="${HOST_COLOR:-}"
 INSTALL_DOCKER="${INSTALL_DOCKER:-1}"
 DOCKER_SOURCE="${DOCKER_SOURCE:-official}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-}"
-DISABLE_SWAP="${DISABLE_SWAP:-1}"
-CLUSTER_CIDR="${CLUSTER_CIDR:-}"
-HOSTS_ENTRIES="${HOSTS_ENTRIES:-}"
-K3S_ROLE="${K3S_ROLE:-}"
-ALLOW_32BIT="${ALLOW_32BIT:-0}"
 BASE_GIT_CREDENTIAL_CACHE_TIMEOUT="${BASE_GIT_CREDENTIAL_CACHE_TIMEOUT:-900}"
-DEV_USER="${DEV_USER:-${ADMIN_USER:-${SUDO_USER:-}}}"
+DEV_USER="${DEV_USER:-$ADMIN_USER}"
+BUNDLE_DIR="${BUNDLE_DIR:-$(dirname "$(readlink -f "$0")")/bundle}"
 KUBECTL_VERSION="${KUBECTL_VERSION:-}"
+KUBECOLOR_VERSION="${KUBECOLOR_VERSION:-}"
+STARSHIP_VERSION="${STARSHIP_VERSION:-}"
+# Plugins tmux (dépôts GitHub) : doivent correspondre aux « @plugin » de write_tmux_conf
+TMUX_PLUGINS="tmux-plugins/tpm tmux-plugins/tmux-resurrect tmux-plugins/tmux-continuum"
+K3S_KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
 KUBECONFIG_SOURCE="${KUBECONFIG_SOURCE:-}"
 K3S_API="${K3S_API:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-k3s-lab}"
@@ -121,15 +137,28 @@ get_home() {
   getent passwd "$1" | cut -d: -f6
 }
 
+# ADMIN_USER renseigné et différent de root (il peut ne pas encore exister :
+# l'étape user le crée).
 require_admin_user() {
-  [ -n "$ADMIN_USER" ] || die "ADMIN_USER manquant (ex: sudo ADMIN_USER=admin $0)."
+  [ -n "$ADMIN_USER" ] \
+    || die "Utilisateur à configurer inconnu : lance le script avec sudo depuis ton compte, ou indique ADMIN_USER=... (ex: sudo ADMIN_USER=admin $0)."
   [ "$ADMIN_USER" != "root" ] || die "ADMIN_USER doit être un utilisateur normal, pas root."
 }
 
+# ADMIN_USER renseigné ET existant (étapes qui écrivent dans son dossier)
+require_existing_admin_user() {
+  require_admin_user
+  id "$ADMIN_USER" >/dev/null 2>&1 \
+    || die "Utilisateur $ADMIN_USER introuvable : crée-le d'abord (étape user)."
+  log "Configuration pour l'utilisateur $ADMIN_USER et pour root"
+}
+
 require_dev_user() {
-  [ -n "$DEV_USER" ] || die "DEV_USER ou ADMIN_USER manquant pour l'étape dev."
+  [ -n "$DEV_USER" ] \
+    || die "Utilisateur à configurer inconnu : lance le script avec sudo depuis ton compte, ou indique DEV_USER=... ou ADMIN_USER=..."
   [ "$DEV_USER" != "root" ] || die "DEV_USER doit être un utilisateur normal."
   id "$DEV_USER" >/dev/null 2>&1 || die "Utilisateur DEV_USER introuvable : $DEV_USER"
+  log "Configuration pour l'utilisateur $DEV_USER"
 }
 
 check_os() {
@@ -140,9 +169,18 @@ check_os() {
   log "Système : ${PRETTY_NAME:-inconnu} — architecture : $arch — hôte : $(hostname)"
   if [ "${ID:-}" != "debian" ]; then
     warn "Ce script vise Debian ; système détecté : ${ID:-?}."
-  elif [ "${VERSION_ID:-}" != "13" ]; then
-    warn "Ce script est prévu pour Debian 13 ; version détectée : ${VERSION_ID:-?}."
+  elif [ "${VERSION_ID:-}" != "12" ] && [ "${VERSION_ID:-}" != "13" ]; then
+    warn "Ce script est prévu pour Debian 12 ou 13 ; version détectée : ${VERSION_ID:-?}."
   fi
+  if [ "$arch" != "amd64" ]; then
+    warn "Seule l'architecture amd64 est prévue ; détectée : $arch."
+  fi
+}
+
+# Version majeure de Debian (12, 13...), vide si inconnue
+debian_major() {
+  # shellcheck disable=SC1091
+  (. /etc/os-release && echo "${VERSION_ID:-}")
 }
 
 # -----------------------------------------------------------------------------
@@ -151,11 +189,10 @@ check_os() {
 step_packages() {
   log "Installation des paquets de base"
   apt-get update -y
-  apt-get install -y sudo openssh-server curl ca-certificates gnupg tmux git vim-nox \
-    htop jq rsync chrony bash-completion open-iscsi nfs-common cryptsetup dmsetup \
-    thefuck command-not-found most apt-file xclip xsel wl-clipboard ncurses-term 
+  apt-get install -y sudo openssh-server curl ca-certificates gnupg xz-utils git vim-nox \
+    htop jq rsync chrony bash-completion \
+    thefuck command-not-found most apt-file xclip xsel wl-clipboard ncurses-term
   systemctl enable --now chrony
-  systemctl enable --now iscsid
 }
 
 base() {
@@ -665,8 +702,7 @@ style = 'yellow'
 
 [kubernetes]
 disabled = false
-# Contexte, puis namespace courant (choisi avec kns) s'il est défini
-format = '[$symbol$context( \($namespace\))]($style) '
+format = '[$symbol$context]($style) '
 style = 'bold cyan'
 
 [cmd_duration]
@@ -724,34 +760,35 @@ EOF
 }
 
 
+# Les plugins sont extraits du dossier bundle (téléchargés s'ils y manquent)
+# directement dans ~/.tmux/plugins : TPM les charge au démarrage de tmux, sans
+# rien télécharger. Un plugin déjà présent n'est pas touché.
 install_tmux_plugins() {
-  local target_user="$1" home="$2" tpm_dir="$home/.tmux/plugins/tpm" grp
+  local target_user="$1" home="$2" grp repo name
   grp="$(id -gn "$target_user")"
+  install -d -o "$target_user" -g "$grp" -m 755 "$home/.tmux" "$home/.tmux/plugins"
+  mkdir -p "$BUNDLE_DIR"
 
-  install -d -o "$target_user" -g "$grp" -m 755 "$home/.tmux/plugins"
-
-  if [ ! -d "$tpm_dir/.git" ]; then
-    log "Installation de TPM pour $target_user"
-    sudo -u "$target_user" env HOME="$home" \
-      git clone https://github.com/tmux-plugins/tpm "$tpm_dir"
-  else
-    log "TPM existe déjà pour $target_user"
-  fi
-
-  # Le script TPM lit ~/.tmux.conf et installe les plugins déclarés.
-  if [ -x "$tpm_dir/bin/install_plugins" ]; then
-    log "Installation des plugins tmux pour $target_user"
-    sudo -u "$target_user" env HOME="$home" \
-      "$tpm_dir/bin/install_plugins"
-  else
-    warn "Le script TPM install_plugins est absent pour $target_user."
-  fi
+  for repo in $TMUX_PLUGINS; do
+    name="${repo#*/}"
+    if [ -d "$home/.tmux/plugins/$name" ]; then
+      log "Plugin tmux $name déjà présent pour $target_user"
+      continue
+    fi
+    # Sous-shell : un échec (pas d'internet, bundle incomplet) n'arrête pas le script
+    if ! ( download_tmux_plugin "$repo" ); then
+      warn "Plugin tmux $name indisponible : ignoré."
+      continue
+    fi
+    log "Installation du plugin tmux $name pour $target_user"
+    tar -xzf "$BUNDLE_DIR/tmux-plugin-${name}.tar.gz" -C "$home/.tmux/plugins"
+  done
 
   chown -R "$target_user:$grp" "$home/.tmux"
 }
 
 step_shell() {
-  require_admin_user
+  require_existing_admin_user
   local idx col u home grp cfg
   local -a palette=(34 33 208 135 160 37)
   if [ -n "$HOST_COLOR" ]; then
@@ -762,7 +799,8 @@ step_shell() {
   fi
   log "Configuration de tmux et du prompt Starship (couleur $col pour $(hostname))"
   apt-get update -y
-  apt-get install -y starship
+  install_tmux
+  install_starship
   write_clip_helper
   for u in "$ADMIN_USER" root; do
     home="$(get_home "$u")"
@@ -773,9 +811,12 @@ step_shell() {
     fi
     write_tmux_conf "$home/.tmux.conf" "$col"
     install_tmux_plugins "$u" "$home"
-    mkdir -p "$home/.vim/undo"
+    install -d -o "$u" -g "$grp" -m 755 "$home/.vim" "$home/.vim/undo"
     write_vim_conf "$home/.vimrc" "$col"
+    chown "$u:$grp" "$home/.vimrc"
+    find "$home" -maxdepth 1 -name '.vimrc.bak.*' -exec chown "$u:$grp" {} +
     install -d -o "$u" -g "$grp" -m 755 "$home/.config"
+    chown "$u:$grp" "$home/.config"
     cfg="$home/.config/starship.toml"
     write_starship_config "$cfg" "$col"
     chown "$u:$grp" "$cfg"
@@ -884,196 +925,267 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# k3s-prep — préparation du système pour k3s
+# download — binaires hors dépôts Debian, rangés dans BUNDLE_DIR (amd64)
 # -----------------------------------------------------------------------------
-step_k3s_prep() {
-  local arch u c p name ip
-  arch="$(dpkg --print-architecture)"
-  log "Préparation du système pour k3s (architecture $arch)"
+# Chaque fichier n'est téléchargé que s'il manque dans BUNDLE_DIR, puis vérifié
+# avec la somme de contrôle publiée par son projet. Sur une machine sans
+# internet, les étapes shell et kubectl trouvent tout dans ce dossier.
+#   kubectl                 dl.k8s.io (somme .sha256)
+#   kubecolor               GitHub kubecolor/kubecolor (checksums.txt)
+#   starship                GitHub starship/starship, binaire statique musl
+#                           (somme .sha256) : absent des dépôts Debian 12
+#   tmux_*.deb              tmux 3.5a de bookworm-backports (le tmux 3.3a de
+#   libjemalloc2_*.deb      Debian 12 est ancien) et sa dépendance ; sommes
+#                           SHA256 de l'index de l'archive Debian
+#   tmux-plugin-*.tar.gz    plugins tmux (TMUX_PLUGINS), clonés depuis GitHub en
+#                           HTTPS avec leur dossier .git (mise à jour possible
+#                           plus tard avec prefix + U) ; le commit est noté dans
+#                           VERSIONS (pas de somme publiée par ces projets)
+DEBIAN_MIRROR="https://deb.debian.org/debian"
 
-  case "$arch" in
-    amd64|arm64) ;;
-    armhf|armel)
-      warn "OS ARM 32 bits ($arch) : etcd n'y est pas officiellement supporté. Utilise un Debian arm64 pour un serveur k3s."
-      ;;
-  esac
+# Dernière version publiée d'un projet GitHub (ex: v1.26.0)
+gh_latest() {
+  curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$1/releases/latest" \
+    | sed 's#.*/tag/##'
+}
 
-  # Modules noyau requis par le réseau des conteneurs
-  printf 'overlay\nbr_netfilter\n' > /etc/modules-load.d/k3s.conf
-  modprobe overlay || warn "Module overlay indisponible"
-  modprobe br_netfilter || warn "Module br_netfilter indisponible"
-
-  # Paramètres noyau : routage entre pods, filtrage des ponts, limites inotify
-  # (les valeurs par défaut sont trop basses pour de nombreux pods).
-  cat > /etc/sysctl.d/90-k3s.conf <<'EOF'
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-fs.inotify.max_user_instances = 512
-fs.inotify.max_user_watches = 524288
-EOF
-  sysctl --system >/dev/null
-
-  # Swap : Kubernetes attend qu'il soit désactivé. Attention sur une machine à
-  # 2 Go de RAM : sans swap, un dépassement mémoire déclenche l'OOM killer.
-  if [ "$DISABLE_SWAP" = "1" ]; then
-    swapoff -a || true
-    sed -i -E 's|^([^#].*[[:space:]]swap[[:space:]].*)$|# \1  # désactivé par bootstrap-node.sh|' /etc/fstab
-    for u in dphys-swapfile.service zramswap.service armbian-zram-config.service; do
-      if systemctl list-unit-files "$u" 2>/dev/null | grep -q "^$u"; then
-        systemctl disable --now "$u" 2>/dev/null || true
-      fi
-    done
+# Vérifie la somme SHA256 d'un fichier, l'efface si elle est fausse
+check_sha256() {
+  local file="$1" expected="$2"
+  if ! echo "${expected}  ${file}" | sha256sum -c --quiet - >/dev/null 2>&1; then
+    rm -f "$file"
+    die "Somme de contrôle invalide pour $(basename "$file") : fichier supprimé."
   fi
+}
 
-  # cgroups v2 avec les contrôleurs nécessaires (important sur les cartes ARM)
-  if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
-    for c in cpu memory pids; do
-      if ! grep -qw "$c" /sys/fs/cgroup/cgroup.controllers; then
-        warn "Contrôleur cgroup '$c' absent. Ajoute 'cgroup_enable=memory cgroup_memory=1' aux paramètres de démarrage du noyau (fichier dépendant de ta carte), puis redémarre."
-      fi
-    done
+bundle_note() {
+  echo "$1" >> "$BUNDLE_DIR/VERSIONS"
+}
+
+download_kubectl() {
+  local ver tmp
+  [ -x "$BUNDLE_DIR/kubectl" ] && return 0
+  ver="$KUBECTL_VERSION"
+  if [ -z "$ver" ]; then
+    ver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" \
+      || die "kubectl absent de $BUNDLE_DIR et téléchargement impossible (pas d'internet ?). Lance « download » sur une machine connectée."
+  fi
+  ver="v${ver#v}"
+  log "Téléchargement de kubectl $ver"
+  tmp="$BUNDLE_DIR/kubectl.part"
+  curl -fsSL -o "$tmp" "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl"
+  check_sha256 "$tmp" "$(curl -fsSL "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl.sha256")"
+  chmod 755 "$tmp"
+  mv "$tmp" "$BUNDLE_DIR/kubectl"
+  bundle_note "kubectl $ver"
+}
+
+download_kubecolor() {
+  local ver tgz tmp sum
+  [ -x "$BUNDLE_DIR/kubecolor" ] && return 0
+  ver="${KUBECOLOR_VERSION:-$(gh_latest kubecolor/kubecolor || true)}"
+  [ -n "$ver" ] \
+    || die "kubecolor absent de $BUNDLE_DIR et téléchargement impossible (pas d'internet ?). Lance « download » sur une machine connectée."
+  ver="v${ver#v}"
+  log "Téléchargement de kubecolor $ver"
+  tgz="kubecolor_${ver#v}_linux_amd64.tar.gz"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/$tgz" "https://github.com/kubecolor/kubecolor/releases/download/${ver}/${tgz}"
+  sum="$(curl -fsSL "https://github.com/kubecolor/kubecolor/releases/download/${ver}/checksums.txt" \
+    | awk -v f="$tgz" '$2 == f { print $1 }')"
+  [ -n "$sum" ] || { rm -rf "$tmp"; die "Somme de contrôle de $tgz introuvable."; }
+  check_sha256 "$tmp/$tgz" "$sum"
+  tar -xzf "$tmp/$tgz" -C "$tmp" kubecolor
+  install -m 755 "$tmp/kubecolor" "$BUNDLE_DIR/kubecolor"
+  rm -rf "$tmp"
+  bundle_note "kubecolor $ver"
+}
+
+download_starship() {
+  local ver tgz tmp
+  [ -x "$BUNDLE_DIR/starship" ] && return 0
+  ver="${STARSHIP_VERSION:-$(gh_latest starship/starship || true)}"
+  [ -n "$ver" ] \
+    || die "starship absent de $BUNDLE_DIR et téléchargement impossible (pas d'internet ?). Lance « download » sur une machine connectée."
+  ver="v${ver#v}"
+  log "Téléchargement de Starship $ver"
+  tgz="starship-x86_64-unknown-linux-musl.tar.gz"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/$tgz" "https://github.com/starship/starship/releases/download/${ver}/${tgz}"
+  check_sha256 "$tmp/$tgz" \
+    "$(curl -fsSL "https://github.com/starship/starship/releases/download/${ver}/${tgz}.sha256" | awk '{ print $1 }')"
+  tar -xzf "$tmp/$tgz" -C "$tmp" starship
+  install -m 755 "$tmp/starship" "$BUNDLE_DIR/starship"
+  rm -rf "$tmp"
+  bundle_note "starship $ver"
+}
+
+# Télécharge un paquet .deb de l'archive Debian : suite, paquet
+download_debian_deb() {
+  local suite="$1" pkg="$2" info file sum
+  if ls "$BUNDLE_DIR/${pkg}"_*_amd64.deb >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Téléchargement de $pkg ($suite)"
+  info="$(curl -fsSL "$DEBIAN_MIRROR/dists/${suite}/main/binary-amd64/Packages.xz" | xz -dc \
+    | awk -v p="$pkg" '$0 == "Package: " p { f = 1 } f && /^Filename:/ { n = $2 } f && /^SHA256:/ { h = $2 } f && /^$/ { print n, h; exit }' || true)"
+  file="${info% *}"
+  sum="${info#* }"
+  [ -n "$info" ] && [ -n "$file" ] && [ -n "$sum" ] \
+    || die "$pkg absent de $BUNDLE_DIR et introuvable dans $suite (pas d'internet ?). Lance « download » sur une machine connectée."
+  curl -fsSL -o "$BUNDLE_DIR/$(basename "$file")" "$DEBIAN_MIRROR/$file"
+  check_sha256 "$BUNDLE_DIR/$(basename "$file")" "$sum"
+  bundle_note "$(basename "$file")"
+}
+
+download_tmux_deb() {
+  download_debian_deb bookworm-backports tmux
+  download_debian_deb bookworm libjemalloc2
+}
+
+# Archive un plugin tmux depuis GitHub : dépôt « auteur/nom »
+download_tmux_plugin() {
+  local repo="$1" name="${1#*/}" tgz tmp commit
+  tgz="$BUNDLE_DIR/tmux-plugin-${name}.tar.gz"
+  [ -s "$tgz" ] && return 0
+  log "Téléchargement du plugin tmux $repo"
+  tmp="$(mktemp -d)"
+  if ! git clone -q --depth 1 "https://github.com/${repo}" "$tmp/$name"; then
+    rm -rf "$tmp"
+    die "Plugin tmux $repo absent de $BUNDLE_DIR et téléchargement impossible (pas d'internet ?). Lance « download » sur une machine connectée."
+  fi
+  commit="$(git -C "$tmp/$name" rev-parse --short HEAD)"
+  tar -czf "$tgz.part" -C "$tmp" "$name"
+  mv "$tgz.part" "$tgz"
+  rm -rf "$tmp"
+  bundle_note "tmux-plugin $repo $commit"
+}
+
+require_amd64() {
+  [ "$(dpkg --print-architecture 2>/dev/null || uname -m)" = "amd64" ] \
+    || die "Binaires prévus pour amd64 uniquement ; architecture : $(dpkg --print-architecture 2>/dev/null || uname -m)."
+}
+
+step_download() {
+  local repo
+  require_amd64
+  mkdir -p "$BUNDLE_DIR"
+  download_kubectl
+  download_kubecolor
+  download_starship
+  download_tmux_deb
+  for repo in $TMUX_PLUGINS; do
+    download_tmux_plugin "$repo"
+  done
+  log "Binaires prêts dans $BUNDLE_DIR :"
+  ls -lh "$BUNDLE_DIR"
+}
+
+# tmux : paquet natif sur Debian 13, tmux 3.5a des backports sur Debian 12
+install_tmux() {
+  local major
+  major="$(debian_major)"
+  if [ "$major" = "12" ]; then
+    require_amd64
+    mkdir -p "$BUNDLE_DIR"
+    download_tmux_deb
+    log "Installation de tmux 3.5a (bookworm-backports)"
+    apt-get install -y "$BUNDLE_DIR"/libjemalloc2_*_amd64.deb "$BUNDLE_DIR"/tmux_*_amd64.deb
   else
-    warn "cgroups v2 non détectés (/sys/fs/cgroup/cgroup.controllers absent) : k3s peut mal fonctionner."
+    apt-get install -y tmux
   fi
-
-  # multipathd vole les disques virtuels de Longhorn : on l'en écarte
-  if command -v multipathd >/dev/null 2>&1; then
-    if ! grep -q 'devnode "^sd\[a-z0-9\]+"' /etc/multipath.conf 2>/dev/null; then
-      cat >> /etc/multipath.conf <<'EOF'
-blacklist {
-    devnode "^sd[a-z0-9]+"
 }
-EOF
-      systemctl restart multipathd || true
-    fi
-  fi
 
-  # Noms des nœuds dans /etc/hosts (bloc géré, le reste du fichier n'est pas touché)
-  if [ -n "$HOSTS_ENTRIES" ]; then
-    sed -i '/# BEGIN lab-nodes/,/# END lab-nodes/d' /etc/hosts
-    {
-      echo "# BEGIN lab-nodes"
-      IFS=',' read -ra pairs <<< "$HOSTS_ENTRIES"
-      for p in "${pairs[@]}"; do
-        name="${p%%=*}"
-        ip="${p#*=}"
-        echo "$ip $name"
-      done
-      echo "# END lab-nodes"
-    } >> /etc/hosts
-    log "Noms des nœuds ajoutés à /etc/hosts"
-  fi
-
-  # Pare-feu : seulement si ufw est actif (Debian n'en installe pas par défaut)
-  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-    if [ -n "$CLUSTER_CIDR" ]; then
-      log "Ouverture des ports k3s dans ufw pour $CLUSTER_CIDR"
-      ufw allow from "$CLUSTER_CIDR" to any port 6443 proto tcp
-      ufw allow from "$CLUSTER_CIDR" to any port 2379:2380 proto tcp
-      ufw allow from "$CLUSTER_CIDR" to any port 10250 proto tcp
-      ufw allow from "$CLUSTER_CIDR" to any port 8472 proto udp
-      ufw allow from 10.42.0.0/16 to any
-      ufw allow from 10.43.0.0/16 to any
-    else
-      warn "ufw est actif : définis CLUSTER_CIDR (ex: 192.168.1.0/24) pour ouvrir 6443, 2379-2380, 10250 (tcp) et 8472 (udp)."
-    fi
+# Starship : paquet natif sur Debian 13, binaire officiel sur Debian 12
+install_starship() {
+  local major
+  major="$(debian_major)"
+  if [ "$major" = "12" ]; then
+    require_amd64
+    mkdir -p "$BUNDLE_DIR"
+    download_starship
+    log "Installation de Starship dans /usr/local/bin"
+    install -m 755 "$BUNDLE_DIR/starship" /usr/local/bin/starship
+  else
+    apt-get install -y starship
   fi
 }
 
 # -----------------------------------------------------------------------------
-# k3s — installation, déléguée à install-k3s-lab.sh (même dossier)
+# kubectl — kubectl, kubecolor, kubeconfig, alias k/kns et complétion
 # -----------------------------------------------------------------------------
-step_k3s() {
-  [ -n "$K3S_ROLE" ] || die "K3S_ROLE manquant : init | join | etcd | agent."
-  local script arch
-  script="$(dirname "$(readlink -f "$0")")/install-k3s-lab.sh"
-  [ -f "$script" ] || die "install-k3s-lab.sh introuvable à côté de ce script ($script)."
-  arch="$(dpkg --print-architecture)"
-  if { [ "$arch" = "armhf" ] || [ "$arch" = "armel" ]; } && [ "$ALLOW_32BIT" != "1" ]; then
-    die "OS ARM 32 bits ($arch) : etcd n'est pas officiellement supporté. Installe un Debian arm64 (ou ALLOW_32BIT=1 à tes risques)."
-  fi
-  log "Installation de k3s, rôle : $K3S_ROLE"
-  case "$K3S_ROLE" in
-    init)  bash "$script" server ;;
-    join)  bash "$script" server-join ;;
-    etcd)  ETCD_ONLY=1 bash "$script" server-join ;;
-    agent) bash "$script" agent ;;
-    *) die "K3S_ROLE inconnu : $K3S_ROLE (init | join | etcd | agent)." ;;
-  esac
-}
-
-# -----------------------------------------------------------------------------
-# kubectl — piloter le cluster depuis un poste sans k3s (WSL, portable)
-# -----------------------------------------------------------------------------
-# Sur les nœuds, kubectl est fourni par k3s (/usr/local/bin/kubectl -> k3s).
-# Sur un poste, on installe le kubectl officiel, puis on récupère le kubeconfig
-# d'un serveur. Ce kubeconfig pointe vers 127.0.0.1 : on le remplace par
-# l'adresse du serveur, et on renomme « default » en KUBE_CONTEXT pour pouvoir
-# le fusionner avec d'autres clusters (kubectx pour passer de l'un à l'autre).
-install_kubectl_pkg() {
-  local minor
+# Sur un nœud k3s, /usr/local/bin/kubectl est un lien vers k3s : il est gardé.
+# Ailleurs, le kubectl officiel est installé depuis BUNDLE_DIR. kubens (paquet
+# Debian kubectx, natif sur Debian 12 et 13) change de namespace : alias kns.
+install_kubectl_bin() {
   if [ "$(readlink /usr/local/bin/kubectl 2>/dev/null)" = "k3s" ]; then
     log "k3s est installé ici : son kubectl intégré est utilisé."
     return 0
   fi
-  minor="${KUBECTL_VERSION:-}"
-  if [ -z "$minor" ]; then
-    minor="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" \
-      || die "Version stable de kubectl introuvable (réseau ?). Indique KUBECTL_VERSION=v1.xx."
-  fi
-  minor="v${minor#v}"
-  minor="$(echo "$minor" | cut -d. -f1,2)"
-  [[ "$minor" =~ ^v1\.[0-9]+$ ]] || die "KUBECTL_VERSION invalide : $minor (ex: v1.33)."
-
-  log "Installation de kubectl $minor (dépôt officiel pkgs.k8s.io)"
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://pkgs.k8s.io/core:/stable:/${minor}/deb/Release.key" \
-    | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  cat > /etc/apt/sources.list.d/kubernetes.sources <<EOF
-Types: deb
-URIs: https://pkgs.k8s.io/core:/stable:/${minor}/deb/
-Suites: /
-Signed-By: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-EOF
-  apt-get update -y
-  apt-get install -y kubectl
+  require_amd64
+  mkdir -p "$BUNDLE_DIR"
+  download_kubectl
+  log "Installation de kubectl dans /usr/local/bin"
+  install -m 755 "$BUNDLE_DIR/kubectl" /usr/local/bin/kubectl
 }
 
-fetch_kubeconfig() {
-  local home grp kdir cfg new merged api host
+install_kubecolor_bin() {
+  require_amd64
+  mkdir -p "$BUNDLE_DIR"
+  download_kubecolor
+  log "Installation de kubecolor dans /usr/local/bin"
+  install -m 755 "$BUNDLE_DIR/kubecolor" /usr/local/bin/kubecolor
+}
+
+# Installe ~/.kube/config pour DEV_USER :
+#   KUBECONFIG_SOURCE défini : copié par SSH depuis ce serveur, l'adresse
+#     127.0.0.1 remplacée par celle du serveur ;
+#   sinon, sur un nœud k3s : copie locale de /etc/rancher/k3s/k3s.yaml
+#     (127.0.0.1 : chaque serveur parle à sa propre API, ce qui permet de
+#     piloter le cluster depuis B ou C si A est tombé).
+# Le contexte « default » de k3s est renommé KUBE_CONTEXT, puis fusionné avec
+# un kubeconfig existant (sauvegardé) ; il devient le contexte courant.
+setup_user_kubeconfig() {
+  local home grp kdir cfg new merged api="" host
   home="$(get_home "$DEV_USER")"
   grp="$(id -gn "$DEV_USER")"
   kdir="$home/.kube"
   cfg="$kdir/config"
-  install -d -m 700 -o "$DEV_USER" -g "$grp" "$kdir"
-
-  log "Copie du kubeconfig depuis $KUBECONFIG_SOURCE (SSH en tant que $DEV_USER)"
   new="$(mktemp)"
   merged="$(mktemp)"
-  # SSH lancé en tant que DEV_USER : sa clé et son ~/.ssh/config sont utilisés.
-  if ! sudo -u "$DEV_USER" env HOME="$home" \
-       ssh "$KUBECONFIG_SOURCE" 'cat ~/.kube/config' > "$new" \
-     || ! grep -q '^apiVersion:' "$new"; then
-    rm -f "$new" "$merged"
-    die "Kubeconfig introuvable sur $KUBECONFIG_SOURCE (~/.kube/config). Lance d'abord install-k3s-lab.sh sur ce serveur avec sudo."
-  fi
 
-  # Adresse de l'API : K3S_API, sinon l'adresse réelle derrière l'alias SSH
-  api="$K3S_API"
-  if [ -z "$api" ]; then
-    host="${KUBECONFIG_SOURCE#*@}"
-    api="$(sudo -u "$DEV_USER" env HOME="$home" ssh -G "$host" 2>/dev/null \
-      | awk '$1 == "hostname" { print $2; exit }' || true)"
-    api="${api:-$host}"
+  if [ -n "$KUBECONFIG_SOURCE" ]; then
+    log "Copie du kubeconfig depuis $KUBECONFIG_SOURCE (SSH en tant que $DEV_USER)"
+    # SSH lancé en tant que DEV_USER : sa clé et son ~/.ssh/config sont utilisés.
+    if ! runuser -u "$DEV_USER" -- env HOME="$home" \
+         ssh "$KUBECONFIG_SOURCE" 'cat ~/.kube/config' > "$new" \
+       || ! grep -q '^apiVersion:' "$new"; then
+      rm -f "$new" "$merged"
+      die "Kubeconfig introuvable sur $KUBECONFIG_SOURCE (~/.kube/config). Lance d'abord « sudo ./bootstrap-node.sh kubectl » sur ce serveur."
+    fi
+    # Adresse de l'API : K3S_API, sinon l'adresse réelle derrière l'alias SSH
+    api="$K3S_API"
+    if [ -z "$api" ]; then
+      host="${KUBECONFIG_SOURCE#*@}"
+      api="$(runuser -u "$DEV_USER" -- env HOME="$home" ssh -G "$host" 2>/dev/null \
+        | awk '$1 == "hostname" { print $2; exit }' || true)"
+      api="${api:-$host}"
+    fi
+    sed -i -E "s#(server: https://)(127\.0\.0\.1|localhost)(:[0-9]+)#\1${api}\3#" "$new"
+  elif [ -r "$K3S_KUBECONFIG" ]; then
+    log "Kubeconfig local de k3s copié pour $DEV_USER"
+    cp "$K3S_KUBECONFIG" "$new"
+    if [ -n "$K3S_API" ]; then
+      sed -i -E "s#(server: https://)(127\.0\.0\.1|localhost)(:[0-9]+)#\1${K3S_API}\3#" "$new"
+    fi
+  else
+    rm -f "$new" "$merged"
+    warn "Pas de k3s ici et KUBECONFIG_SOURCE vide : aucun kubeconfig installé (ex: KUBECONFIG_SOURCE=nas1)."
+    return 0
   fi
-  sed -i -E "s#(server: https://)(127\.0\.0\.1|localhost)(:[0-9]+)#\1${api}\3#" "$new"
   sed -i -E "s/^([[:space:]-]*)(name|cluster|user|current-context): default$/\1\2: ${KUBE_CONTEXT}/" "$new"
 
-  # Fusion avec un kubeconfig existant : le nouveau contexte remplace un
-  # éventuel homonyme et devient le contexte courant.
+  install -d -m 700 -o "$DEV_USER" -g "$grp" "$kdir"
   if [ -s "$cfg" ]; then
     cp -a "$cfg" "$cfg.bak.$(date +%Y%m%d-%H%M%S)"
     KUBECONFIG="$new:$cfg" kubectl config view --flatten > "$merged"
@@ -1082,36 +1194,122 @@ fetch_kubeconfig() {
     install -m 600 -o "$DEV_USER" -g "$grp" "$new" "$cfg"
   fi
   rm -f "$new" "$merged"
-  log "Contexte « $KUBE_CONTEXT » écrit dans $cfg (API : https://${api}:6443)"
+  log "Contexte « $KUBE_CONTEXT » écrit dans $cfg"
 
-  if sudo -u "$DEV_USER" env HOME="$home" KUBECONFIG="$cfg" \
+  if runuser -u "$DEV_USER" -- env HOME="$home" KUBECONFIG="$cfg" \
        kubectl --context "$KUBE_CONTEXT" --request-timeout=10s get nodes; then
     log "Le cluster répond."
   else
-    warn "Le cluster ne répond pas. Vérifie que ${api}:6443 est joignable depuis ce poste et figure dans le certificat (K3S_TLS_SAN)."
+    warn "Le cluster ne répond pas. Vérifie que l'API (port 6443) est joignable et figure dans le certificat (K3S_TLS_SAN)."
   fi
+}
+
+# Écrit ~/.bash_kubectl : alias k et kns, complétion (chargé depuis ~/.bashrc).
+# Le contexte courant s'affiche dans le prompt Starship (module kubernetes).
+#
+# POURQUOI LA COMPLÉTION DISPARAÎT AVEC UN ALIAS : bash attache la complétion au
+# NOM de la commande. kubectl a la sienne (fonction __start_kubectl), mais pas
+# « kubecolor » ni l'alias « k ». On leur rattache donc explicitement la même
+# fonction avec « complete -o default -F __start_kubectl ... ».
+write_kubectl_shell() {
+  local file="$1"
+  {
+    echo "# ~/.bash_kubectl — kubectl : couleur, alias k et kns, complétion (géré par bootstrap-node.sh)"
+    echo "LAB_K3S_KUBECONFIG=${K3S_KUBECONFIG}"
+  } > "$file"
+  cat >> "$file" <<'EOF'
+
+[[ $- == *i* ]] || return 0
+
+# Retire d'éventuels alias k/kubectl : un alias empêche de définir une fonction du même nom
+unalias k kubectl 2>/dev/null || true
+
+if command -v kubectl >/dev/null 2>&1; then
+  # Sans ~/.kube/config (root sur un nœud), on lit le kubeconfig de k3s
+  if [ -z "${KUBECONFIG:-}" ] && [ ! -r "$HOME/.kube/config" ] && [ -r "$LAB_K3S_KUBECONFIG" ]; then
+    export KUBECONFIG="$LAB_K3S_KUBECONFIG"
+  fi
+  # Charge bash-completion si ce shell ne l'a pas fait (le .bashrc de root, par ex.)
+  if ! type _init_completion >/dev/null 2>&1 && [ -f /usr/share/bash-completion/bash_completion ]; then
+    . /usr/share/bash-completion/bash_completion
+  fi
+  # Fonction __start_kubectl (déjà fournie par /etc/bash_completion.d/kubectl si présent)
+  if ! type __start_kubectl >/dev/null 2>&1; then
+    source <(kubectl completion bash 2>/dev/null)
+  fi
+
+  if command -v kubecolor >/dev/null 2>&1; then
+    # kubecolor colorise la sortie de kubectl. Pendant la complétion, kubectl est
+    # rappelé avec « __complete » : si kubecolor colorise CETTE réponse, les codes
+    # couleur polluent le résultat et bash affiche « ((: 4 : erreur de syntaxe ».
+    # On passe donc par des fonctions (et non des alias) qui envoient la complétion
+    # directement au vrai kubectl et tout le reste à kubecolor.
+    __lab_kc() {
+      if [ "${1:-}" = "__complete" ] || [ "${1:-}" = "__completeNoDesc" ]; then
+        command kubectl "$@"
+      else
+        command kubecolor "$@"
+      fi
+    }
+    kubectl() { __lab_kc "$@"; }
+    k() { __lab_kc "$@"; }
+  else
+    alias k=kubectl
+  fi
+  complete -o default -F __start_kubectl kubectl
+  complete -o default -F __start_kubectl k
+fi
+
+# kns = kubens : sans argument, liste les namespaces (le courant en surbrillance) ;
+# « kns monappli » en fait le namespace par défaut ; « kns - » revient au
+# précédent. bash-completion ne charge la complétion qu'à la demande, d'après le
+# nom de la commande : « kns » n'a pas de fichier, on charge donc celui de
+# kubens puis on le rattache à l'alias.
+if command -v kubens >/dev/null 2>&1; then
+  alias kns=kubens
+  if ! type _kube_namespaces >/dev/null 2>&1 && [ -f /usr/share/bash-completion/completions/kubens.bash ]; then
+    . /usr/share/bash-completion/completions/kubens.bash
+  fi
+  if type _kube_namespaces >/dev/null 2>&1; then
+    complete -F _kube_namespaces kns
+  fi
+fi
+EOF
 }
 
 step_kubectl() {
   require_dev_user
-  local script
-  install_kubectl_pkg
+  log "Shell kubectl configuré pour $DEV_USER et pour root"
+  local tmp u home grp
+  install_kubectl_bin
+  install_kubecolor_bin
   apt-get install -y kubectx bash-completion
 
-  if [ -n "$KUBECONFIG_SOURCE" ]; then
-    fetch_kubeconfig
-  else
-    warn "KUBECONFIG_SOURCE vide : aucun kubeconfig copié (ex: KUBECONFIG_SOURCE=nas1)."
-  fi
+  setup_user_kubeconfig
 
-  # Alias k/kns, complétion, kubecolor et prompt : même configuration que sur
-  # les nœuds, fournie par install-k3s-lab.sh.
-  script="$(dirname "$(readlink -f "$0")")/install-k3s-lab.sh"
-  if [ -f "$script" ]; then
-    SHELL_USERS="$DEV_USER" bash "$script" kubectl-setup
-  else
-    warn "install-k3s-lab.sh introuvable à côté de ce script : alias et complétion non configurés."
+  # Complétion système (fichier statique : démarrage de shell plus rapide)
+  tmp="$(mktemp)"
+  if kubectl completion bash > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mkdir -p /etc/bash_completion.d
+    install -m 644 "$tmp" /etc/bash_completion.d/kubectl
   fi
+  rm -f "$tmp"
+
+  # kube-ps1 d'une ancienne version de ces scripts : remplacé par Starship
+  rm -rf /usr/local/share/kube-ps1
+
+  for u in "$DEV_USER" root; do
+    home="$(get_home "$u")"
+    grp="$(id -gn "$u")"
+    write_kubectl_shell "$home/.bash_kubectl"
+    touch "$home/.bashrc"
+    sed -i 's/^# kubectl : couleur, alias k\/kns, complétion, prompt$/# kubectl : couleur, alias k et kns, complétion/' "$home/.bashrc"
+    if ! grep -qF '.bash_kubectl' "$home/.bashrc"; then
+      printf '\n# kubectl : couleur, alias k et kns, complétion\n[ -f "$HOME/.bash_kubectl" ] && . "$HOME/.bash_kubectl"\n' >> "$home/.bashrc"
+    fi
+    chown "$u:$grp" "$home/.bash_kubectl" "$home/.bashrc"
+  done
+  log "kubectl : alias k et kns, complétion configurés (ouvre un nouveau shell ou : source ~/.bashrc)"
 }
 
 summary() {
@@ -1123,8 +1321,8 @@ Nœud $(hostname) prêt.
 Étapes suivantes :
   1. Reconnecte-toi en tant que ${ADMIN_USER:-ton utilisateur} (groupes sudo/docker pris en compte).
   2. Lance la préparation sur les autres machines.
-  3. Installe k3s UN nœud à la fois, dans l'ordre (voir l'en-tête du script) :
-       nas1 -> K3S_ROLE=init    nas2 -> K3S_ROLE=join    nas3 (ARM) -> K3S_ROLE=etcd
+  3. Installe k3s UN nœud à la fois avec install-k3s-lab.sh (voir son en-tête).
+  4. Puis, sur chaque nœud : sudo ADMIN_USER=${ADMIN_USER:-admin} ./bootstrap-node.sh kubectl
 =============================================================================
 EOF
 }
@@ -1134,6 +1332,11 @@ main() {
   case "$cmd" in
     -h|--help|help)
       awk '/^# bootstrap-node.sh/ { show=1 } show { print; if ($0 == "# =============================================================================" && ++separators == 2) exit }' "$0" | sed 's/^# \{0,1\}//'
+      return 0
+      ;;
+    download)
+      # Pas besoin de root : on écrit seulement dans BUNDLE_DIR
+      step_download
       return 0
       ;;
   esac
@@ -1147,7 +1350,6 @@ main() {
       step_ssh
       step_shell
       step_docker
-      step_k3s_prep
       summary
       ;;
     packages)  step_packages ;;
@@ -1157,11 +1359,9 @@ main() {
     ssh)       step_ssh ;;
     shell)     step_shell ;;
     docker)    step_docker ;;
-    k3s-prep)  step_k3s_prep ;;
-    k3s)       step_k3s ;;
     kubectl)   step_kubectl ;;
     *)
-      die "Étape inconnue : $cmd (all | packages | base | dev | user | ssh | shell | docker | k3s-prep | k3s | kubectl)."
+      die "Étape inconnue : $cmd (all | packages | base | dev | user | ssh | shell | docker | kubectl | download)."
       ;;
   esac
 }

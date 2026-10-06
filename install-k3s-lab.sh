@@ -41,9 +41,10 @@
 #            ./install-k3s-lab.sh server-join
 #       Le disque est partitionné, formaté en ext4 et monté AVANT l'installation de
 #       k3s. Étape seule : sudo RANCHER_DEVICE=/dev/nvme0n1 ./install-k3s-lab.sh nvme
-#   kubectl en couleur (kubecolor), alias k et kns, complétion, namespace courant
-#       dans le prompt (kube-ps1) : installés automatiquement sur les serveurs.
-#       Relance seule : sudo ./install-k3s-lab.sh kubectl-setup
+#
+#   Ce script n'installe et ne configure QUE k3s (et Longhorn). L'environnement
+#   des machines (kubectl, kubecolor, kubeconfig de l'utilisateur, alias k et
+#   kns, complétion, prompt) est géré par : sudo ./bootstrap-node.sh kubectl
 #
 # PORTS À OUVRIR ENTRE LES MACHINES (si pare-feu actif)
 #   6443/tcp        API Kubernetes
@@ -82,13 +83,10 @@
 #                       des données (EFFACE tout). Inutile pour un disque vierge.
 #   RANCHER_MIGRATE     1 = si k3s est déjà installé, copie /var/lib/rancher vers le
 #                       nouveau disque (k3s est arrêté pendant l'opération)
-#   KUBECOLOR           1 (défaut) = installer kubecolor et aliaser kubectl/k dessus ;
-#                       0 = alias k=kubectl sans couleur
-#   KUBE_PS1            1 (défaut) = installer kube-ps1 et afficher le namespace
-#                       courant dans le prompt ; 0 = prompt inchangé
-#   KUBE_PS1_VERSION    version de kube-ps1 à installer (défaut : v1.0.0)
-#   SHELL_USERS         utilisateurs dont le shell est configuré pour kubectl
-#                       (défaut : l'utilisateur de sudo et root)
+#   DISABLE_SWAP        1 (défaut) = désactiver le swap (recommandé pour Kubernetes)
+#   CLUSTER_CIDR        réseau du lab (ex: 192.168.1.0/24) : ouvre les ports k3s si
+#                       ufw est actif
+#   HOSTS_ENTRIES       noms des nœuds, ex: nas1=192.168.1.10,nas2=192.168.1.11
 # =============================================================================
 
 set -euo pipefail
@@ -106,11 +104,9 @@ REPLICAS="${REPLICAS:-2}"
 RANCHER_DEVICE="${RANCHER_DEVICE:-}"
 RANCHER_FORMAT="${RANCHER_FORMAT:-no}"
 RANCHER_MIGRATE="${RANCHER_MIGRATE:-0}"
-KUBECOLOR="${KUBECOLOR:-1}"
-KUBE_PS1="${KUBE_PS1:-1}"
-KUBE_PS1_VERSION="${KUBE_PS1_VERSION:-v1.0.0}"
-KUBE_PS1_DIR="/usr/local/share/kube-ps1"
-SHELL_USERS="${SHELL_USERS:-}"
+DISABLE_SWAP="${DISABLE_SWAP:-1}"
+CLUSTER_CIDR="${CLUSTER_CIDR:-}"
+HOSTS_ENTRIES="${HOSTS_ENTRIES:-}"
 KUBECONFIG_PATH="/etc/rancher/k3s/k3s.yaml"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -122,19 +118,105 @@ need_root() {
 }
 
 # -----------------------------------------------------------------------------
+# Préparation du système pour k3s : modules noyau, sysctl, swap, cgroups,
+# fichier hosts et pare-feu
+# -----------------------------------------------------------------------------
+system_prep() {
+  local arch u c p name ip
+  arch="$(dpkg --print-architecture)"
+  log "Préparation du système pour k3s (architecture $arch)"
+  case "$arch" in
+    armhf|armel)
+      warn "OS ARM 32 bits ($arch) : etcd n'y est pas officiellement supporté. Utilise un Debian arm64 pour un serveur k3s."
+      ;;
+  esac
+
+  # Modules noyau requis par le réseau des conteneurs
+  printf 'overlay\nbr_netfilter\n' > /etc/modules-load.d/k3s.conf
+  modprobe overlay || warn "Module overlay indisponible"
+  modprobe br_netfilter || warn "Module br_netfilter indisponible"
+
+  # Paramètres noyau : routage entre pods, filtrage des ponts, limites inotify
+  # (les valeurs par défaut sont trop basses pour de nombreux pods).
+  cat > /etc/sysctl.d/90-k3s.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+fs.inotify.max_user_instances = 512
+fs.inotify.max_user_watches = 524288
+EOF
+  sysctl --system >/dev/null
+
+  # Swap : Kubernetes attend qu'il soit désactivé. Attention sur une machine à
+  # 2 Go de RAM : sans swap, un dépassement mémoire déclenche l'OOM killer.
+  if [ "$DISABLE_SWAP" = "1" ]; then
+    swapoff -a || true
+    sed -i -E 's|^([^#].*[[:space:]]swap[[:space:]].*)$|# \1  # désactivé par install-k3s-lab.sh|' /etc/fstab
+    for u in dphys-swapfile.service zramswap.service armbian-zram-config.service; do
+      if systemctl list-unit-files "$u" 2>/dev/null | grep -q "^$u"; then
+        systemctl disable --now "$u" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  # cgroups v2 avec les contrôleurs nécessaires (important sur les cartes ARM)
+  if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+    for c in cpu memory pids; do
+      if ! grep -qw "$c" /sys/fs/cgroup/cgroup.controllers; then
+        warn "Contrôleur cgroup '$c' absent. Ajoute 'cgroup_enable=memory cgroup_memory=1' aux paramètres de démarrage du noyau (fichier dépendant de ta carte), puis redémarre."
+      fi
+    done
+  else
+    warn "cgroups v2 non détectés (/sys/fs/cgroup/cgroup.controllers absent) : k3s peut mal fonctionner."
+  fi
+
+  # Noms des nœuds dans /etc/hosts (bloc géré, le reste du fichier n'est pas touché)
+  if [ -n "$HOSTS_ENTRIES" ]; then
+    sed -i '/# BEGIN lab-nodes/,/# END lab-nodes/d' /etc/hosts
+    {
+      echo "# BEGIN lab-nodes"
+      IFS=',' read -ra pairs <<< "$HOSTS_ENTRIES"
+      for p in "${pairs[@]}"; do
+        name="${p%%=*}"
+        ip="${p#*=}"
+        echo "$ip $name"
+      done
+      echo "# END lab-nodes"
+    } >> /etc/hosts
+    log "Noms des nœuds ajoutés à /etc/hosts"
+  fi
+
+  # Pare-feu : seulement si ufw est actif (Debian n'en installe pas par défaut)
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    if [ -n "$CLUSTER_CIDR" ]; then
+      log "Ouverture des ports k3s dans ufw pour $CLUSTER_CIDR"
+      ufw allow from "$CLUSTER_CIDR" to any port 6443 proto tcp
+      ufw allow from "$CLUSTER_CIDR" to any port 2379:2380 proto tcp
+      ufw allow from "$CLUSTER_CIDR" to any port 10250 proto tcp
+      ufw allow from "$CLUSTER_CIDR" to any port 8472 proto udp
+      ufw allow from 10.42.0.0/16 to any
+      ufw allow from 10.43.0.0/16 to any
+    else
+      warn "ufw est actif : définis CLUSTER_CIDR (ex: 192.168.1.0/24) pour ouvrir 6443, 2379-2380, 10250 (tcp) et 8472 (udp)."
+    fi
+  fi
+}
+
+# -----------------------------------------------------------------------------
 # ÉTAPE 1 — Prérequis (sur TOUTES les machines qui feront tourner Longhorn)
 # -----------------------------------------------------------------------------
 # Longhorn expose chaque volume au pod via iSCSI : il faut donc open-iscsi
 # (le démon iscsid) sur chaque nœud. nfs-common permet les volumes partagés
 # (RWX) et les sauvegardes vers un NFS. cryptsetup/dmsetup servent au
-# chiffrement et à la gestion des périphériques de bloc. kubectx fournit
-# kubectx (changer de contexte) et kubens (changer de namespace par défaut).
+# chiffrement et à la gestion des périphériques de bloc.
 # (Installés aussi sur la machine C : inoffensif, et pratique si elle change de rôle.)
 prereqs() {
   need_root
-  log "Installation des paquets requis (open-iscsi, nfs-common, kubectx, ...)"
+  log "Installation des paquets requis (open-iscsi, nfs-common, ...)"
   apt-get update -y
-  apt-get install -y open-iscsi nfs-common cryptsetup dmsetup curl ca-certificates kubectx
+  apt-get install -y open-iscsi nfs-common cryptsetup dmsetup curl ca-certificates
+  system_prep
 
   log "Activation du démon iSCSI"
   systemctl enable --now iscsid
@@ -251,22 +333,6 @@ install_k3s_server() {
   k3s kubectl wait --for=condition=Ready "node/$(hostname)" --timeout=180s
 }
 
-# Copie le kubeconfig pour l'utilisateur qui a lancé sudo : il peut alors utiliser
-# kubectl/helm sans être root. Le fichier d'origine reste en 600. Ce kubeconfig
-# pointe vers 127.0.0.1 : sur CHAQUE serveur, kubectl parle donc à l'API locale,
-# ce qui permet de piloter le cluster depuis B ou C si A est tombé.
-setup_kubeconfig() {
-  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-    local home
-    home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    mkdir -p "$home/.kube"
-    cp "$KUBECONFIG_PATH" "$home/.kube/config"
-    chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$home/.kube"
-    chmod 600 "$home/.kube/config"
-    log "kubeconfig copié dans $home/.kube/config"
-  fi
-}
-
 # -----------------------------------------------------------------------------
 # Disque dédié à /var/lib/rancher (NVMe) — étape « nvme »
 # -----------------------------------------------------------------------------
@@ -373,213 +439,6 @@ setup_rancher_disk() {
 }
 
 # -----------------------------------------------------------------------------
-# kubectl : couleur (kubecolor), alias k et complétion automatique
-# -----------------------------------------------------------------------------
-# kubecolor appelle kubectl et colorise sa sortie. Il est installé depuis le
-# paquet .deb officiel du projet (amd64 ou arm64).
-#
-# POURQUOI LA COMPLÉTION DISPARAÎT AVEC UN ALIAS : bash attache la complétion au
-# NOM de la commande. kubectl a la sienne (fonction __start_kubectl), mais pas
-# « kubecolor » ni l'alias « k ». On leur rattache donc explicitement la même
-# fonction avec « complete -o default -F __start_kubectl ... », APRÈS avoir chargé
-# la complétion de kubectl.
-install_kubecolor() {
-  if command -v kubecolor >/dev/null 2>&1; then
-    return 0
-  fi
-  local arch ver deb tmp
-  arch="$(dpkg --print-architecture)"
-  case "$arch" in
-    amd64|arm64) ;;
-    *) warn "kubecolor : pas de paquet .deb pour l'architecture $arch."; return 1 ;;
-  esac
-  log "Installation de kubecolor"
-  ver="$(curl -fsSL https://kubecolor.github.io/packages/deb/version | tr -d '[:space:]')" \
-    || { warn "kubecolor : version introuvable (réseau ?)."; return 1; }
-  deb="kubecolor_${ver}_${arch}.deb"
-  tmp="$(mktemp -d)"
-  if curl -fsSL "https://kubecolor.github.io/packages/deb/pool/main/k/kubecolor/${deb}" -o "$tmp/$deb" \
-     && dpkg -i "$tmp/$deb"; then
-    rm -rf "$tmp"
-    return 0
-  fi
-  rm -rf "$tmp"
-  warn "kubecolor : installation impossible, kubectl reste sans couleur."
-  return 1
-}
-
-# kube-ps1 (github.com/jonmosco/kube-ps1) affiche le contexte et le namespace
-# courants dans le prompt. Il n'est pas packagé dans Debian : c'est un seul
-# script shell, téléchargé dans une version fixée (KUBE_PS1_VERSION) pour que
-# tous les nœuds aient le même. Il ne relance kubectl que si le kubeconfig a été
-# modifié (par kubens, par exemple) : le prompt reste instantané.
-install_kube_ps1() {
-  if [ -r "$KUBE_PS1_DIR/kube-ps1.sh" ] \
-     && [ "$(cat "$KUBE_PS1_DIR/VERSION" 2>/dev/null)" = "$KUBE_PS1_VERSION" ]; then
-    return 0
-  fi
-  local tmp
-  log "Installation de kube-ps1 ${KUBE_PS1_VERSION}"
-  tmp="$(mktemp)"
-  if curl -fsSL "https://raw.githubusercontent.com/jonmosco/kube-ps1/${KUBE_PS1_VERSION}/kube-ps1.sh" -o "$tmp" \
-     && [ -s "$tmp" ]; then
-    mkdir -p "$KUBE_PS1_DIR"
-    install -m 644 "$tmp" "$KUBE_PS1_DIR/kube-ps1.sh"
-    echo "$KUBE_PS1_VERSION" > "$KUBE_PS1_DIR/VERSION"
-    rm -f "$tmp"
-    return 0
-  fi
-  rm -f "$tmp"
-  warn "kube-ps1 : téléchargement impossible, le prompt reste inchangé."
-  return 1
-}
-
-# Écrit ~/.bash_kubectl : alias (k, kns), complétion et prompt (chargé depuis ~/.bashrc)
-write_kubectl_shell() {
-  local file="$1" color="$2" ps1="${3:-0}"
-  {
-    echo "# ~/.bash_kubectl — kubectl : couleur, alias k/kns, complétion, prompt (géré par install-k3s-lab.sh)"
-    echo "LAB_KUBECOLOR=${color}"
-    echo "LAB_KUBE_PS1=${ps1}"
-    echo "LAB_KUBE_PS1_SCRIPT=${KUBE_PS1_DIR}/kube-ps1.sh"
-    echo "LAB_K3S_KUBECONFIG=${KUBECONFIG_PATH}"
-  } > "$file"
-  cat >> "$file" <<'EOF'
-
-[[ $- == *i* ]] || return 0
-
-# Retire d'éventuels alias k/kubectl : un alias empêche de définir une fonction du même nom
-unalias k kubectl 2>/dev/null || true
-
-if command -v kubectl >/dev/null 2>&1; then
-  # Charge bash-completion si ce shell ne l'a pas fait (le .bashrc de root, par ex.)
-  if ! type _init_completion >/dev/null 2>&1 && [ -f /usr/share/bash-completion/bash_completion ]; then
-    . /usr/share/bash-completion/bash_completion
-  fi
-  # Fonction __start_kubectl (déjà fournie par /etc/bash_completion.d/kubectl si présent)
-  if ! type __start_kubectl >/dev/null 2>&1; then
-    source <(kubectl completion bash 2>/dev/null)
-  fi
-
-  if [ "${LAB_KUBECOLOR:-1}" = "1" ] && command -v kubecolor >/dev/null 2>&1; then
-    # kubecolor colorise la sortie de kubectl. Pendant la complétion, kubectl est
-    # rappelé avec « __complete » : si kubecolor colorise CETTE réponse, les codes
-    # couleur polluent le résultat et bash affiche « ((: 4 : erreur de syntaxe ».
-    # On passe donc par des fonctions (et non des alias) qui envoient la complétion
-    # directement au vrai kubectl et tout le reste à kubecolor.
-    __lab_kc() {
-      if [ "${1:-}" = "__complete" ] || [ "${1:-}" = "__completeNoDesc" ]; then
-        command kubectl "$@"
-      else
-        command kubecolor "$@"
-      fi
-    }
-    kubectl() { __lab_kc "$@"; }
-    k() { __lab_kc "$@"; }
-  else
-    alias k=kubectl
-  fi
-  complete -o default -F __start_kubectl kubectl
-  complete -o default -F __start_kubectl k
-fi
-
-# kns = kubens (changer de namespace par défaut). bash-completion ne charge la
-# complétion qu'à la demande, d'après le nom de la commande : « kns » n'a pas de
-# fichier, on charge donc celui de kubens puis on le rattache à l'alias.
-if command -v kubens >/dev/null 2>&1; then
-  alias kns=kubens
-  if ! type _kube_namespaces >/dev/null 2>&1 && [ -f /usr/share/bash-completion/completions/kubens.bash ]; then
-    . /usr/share/bash-completion/completions/kubens.bash
-  fi
-  if type _kube_namespaces >/dev/null 2>&1; then
-    complete -F _kube_namespaces kns
-  fi
-fi
-
-# Prompt : namespace courant via kube-ps1, ex. « (⎈|kube-system) user@hôte:~$ »
-# Réglages modifiables en les définissant dans ~/.bashrc AVANT la ligne qui
-# charge ce fichier (voir les variables KUBE_PS1_* de kube-ps1). Désactivation
-# temporaire : kubeoff ; réactivation : kubeon.
-# Avec Starship (étape shell de bootstrap-node.sh), le prompt est reconstruit à
-# chaque commande et effacerait kube-ps1 : c'est alors le module kubernetes de
-# Starship qui affiche le contexte et le namespace.
-if [ "${LAB_KUBE_PS1:-0}" = "1" ] && [ -r "$LAB_KUBE_PS1_SCRIPT" ] && command -v kubectl >/dev/null 2>&1 \
-   && ! command -v starship >/dev/null 2>&1; then
-  # kube-ps1 ne relit la config que si le fichier kubeconfig change, et doit donc
-  # le trouver. root n'a pas de ~/.kube/config : kubectl (k3s) lit alors
-  # /etc/rancher/k3s/k3s.yaml, on l'indique explicitement.
-  if [ -z "${KUBECONFIG:-}" ] && [ ! -r "$HOME/.kube/config" ] && [ -r "$LAB_K3S_KUBECONFIG" ]; then
-    export KUBECONFIG="$LAB_K3S_KUBECONFIG"
-  fi
-  # Le vrai binaire, pas la fonction kubectl ci-dessus (kubecolor) : pas de
-  # codes couleur dans le prompt.
-  KUBE_PS1_BINARY="$(type -P kubectl)"
-  # k3s n'a qu'un contexte, nommé « default » : on n'affiche que le namespace.
-  # Avec plusieurs clusters (kubectx) : KUBE_PS1_CONTEXT_ENABLE=true.
-  : "${KUBE_PS1_CONTEXT_ENABLE:=false}"
-  : "${KUBE_PS1_SEPARATOR:=|}"
-  # Sans namespace enregistré, kubectl utilise « default » : on l'affiche.
-  __lab_kube_ps1_ns() {
-    if [ "$1" = "N/A" ]; then echo default; else echo "$1"; fi
-  }
-  : "${KUBE_PS1_NAMESPACE_FUNCTION:=__lab_kube_ps1_ns}"
-  . "$LAB_KUBE_PS1_SCRIPT"
-  case "$PS1" in
-    *kube_ps1*) ;;
-    *) PS1='$(kube_ps1) '"$PS1" ;;
-  esac
-fi
-EOF
-}
-
-setup_kubectl_shell() {
-  need_root
-  if ! command -v kubectl >/dev/null 2>&1; then
-    warn "kubectl introuvable : k3s est-il installé sur cette machine ?"
-    return 0
-  fi
-  local users u home grp tmp
-  if [ "$KUBECOLOR" = "1" ]; then
-    install_kubecolor || true
-  fi
-  local ps1=0
-  if [ "$KUBE_PS1" = "1" ] && install_kube_ps1; then
-    ps1=1
-  fi
-
-  # Complétion système (fichier statique : démarrage de shell plus rapide)
-  tmp="$(mktemp)"
-  if kubectl completion bash > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-    mkdir -p /etc/bash_completion.d
-    install -m 644 "$tmp" /etc/bash_completion.d/kubectl
-  fi
-  rm -f "$tmp"
-
-  users="${SHELL_USERS:-}"
-  if [ -z "$users" ]; then
-    users="root"
-    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-      users="$SUDO_USER root"
-    fi
-  fi
-  for u in $users; do
-    if ! id "$u" >/dev/null 2>&1; then
-      warn "Utilisateur inconnu pour la config kubectl : $u"
-      continue
-    fi
-    home="$(getent passwd "$u" | cut -d: -f6)"
-    grp="$(id -gn "$u")"
-    write_kubectl_shell "$home/.bash_kubectl" "$KUBECOLOR" "$ps1"
-    touch "$home/.bashrc"
-    if ! grep -qF '.bash_kubectl' "$home/.bashrc"; then
-      printf '\n# kubectl : couleur, alias k/kns, complétion, prompt\n[ -f "$HOME/.bash_kubectl" ] && . "$HOME/.bash_kubectl"\n' >> "$home/.bashrc"
-    fi
-    chown "$u:$grp" "$home/.bash_kubectl" "$home/.bashrc"
-  done
-  log "kubectl : alias k/kns, complétion et prompt configurés (ouvre un nouveau shell ou : source ~/.bashrc)"
-}
-
-# -----------------------------------------------------------------------------
 # ÉTAPE 2 — Premier serveur (machine A) : crée le cluster etcd
 # -----------------------------------------------------------------------------
 server() {
@@ -589,8 +448,6 @@ server() {
   log "Installation du 1er serveur k3s (etcd embarqué)"
   write_k3s_config init
   install_k3s_server
-  setup_kubeconfig
-  setup_kubectl_shell
 
   local ip
   ip="$(hostname -I | awk '{print $1}')"
@@ -604,6 +461,7 @@ server() {
   if [ -z "$K3S_TLS_SAN" ]; then
     warn "K3S_TLS_SAN non défini : l'API ne sera joignable à distance que par l'IP de cette machine."
   fi
+  log "kubectl, kubeconfig utilisateur et alias : sudo ./bootstrap-node.sh kubectl"
 }
 
 # -----------------------------------------------------------------------------
@@ -622,11 +480,10 @@ server_join() {
   log "Ajout de ce serveur au cluster (membre etcd + control plane)"
   write_k3s_config join
   install_k3s_server
-  if [ "$ETCD_ONLY" != "1" ]; then
-    setup_kubeconfig
-    setup_kubectl_shell
-  fi
   log "Serveur ajouté. Vérifie l'état : ./install-k3s-lab.sh status"
+  if [ "$ETCD_ONLY" != "1" ]; then
+    log "kubectl, kubeconfig utilisateur et alias : sudo ./bootstrap-node.sh kubectl"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -799,12 +656,11 @@ case "${1:-}" in
     [ -n "$RANCHER_DEVICE" ] || die "RANCHER_DEVICE manquant (ex: sudo RANCHER_DEVICE=/dev/nvme0n1 $0 nvme)"
     setup_rancher_disk
     ;;
-  kubectl-setup) setup_kubectl_shell ;;
   longhorn)    longhorn ;;
   test)        test_replication ;;
   status)      status ;;
   *)
-    echo "Usage: $0 {prereqs|server|server-join|agent|nvme|kubectl-setup|longhorn|test|status}"
+    echo "Usage: $0 {prereqs|server|server-join|agent|nvme|longhorn|test|status}"
     echo "Voir l'en-tête du script pour le détail des étapes."
     exit 1
     ;;
