@@ -56,11 +56,12 @@
 #     sudo DEV_USER=$USER KUBECONFIG_SOURCE=nas1 ./bootstrap-node.sh kubectl
 #
 # VARIABLES
-#   ADMIN_USER        utilisateur d'administration à créer/configurer, ex: admin
-#                     (défaut : l'utilisateur qui a lancé sudo). Les étapes shell
-#                     et kubectl configurent CET utilisateur ET root ; le script
-#                     refuse de continuer s'il ne sait pas quel utilisateur viser
-#                     (script lancé directement en root, sans sudo ni ADMIN_USER).
+#   ADMIN_USER        utilisateur d'administration à créer/configurer, ex: admin.
+#                     Vide = l'utilisateur courant, annoncé au démarrage : celui qui
+#                     a lancé sudo, sinon celui de la session (après « su - »).
+#                     Les étapes shell et kubectl configurent CET utilisateur ET
+#                     root ; le script refuse de continuer s'il ne trouve que root
+#                     (connexion directe en root, sans ADMIN_USER).
 #   SSH_PUBKEY_FILE   fichier de clé publique à autoriser
 #   SSH_PUBKEY        ou la clé publique elle-même (une ligne)
 #   SUDO_NOPASSWD     1 = sudo sans mot de passe (pratique en lab ; si la clé SSH
@@ -98,10 +99,19 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-# Utilisateur qui a lancé sudo (vide si le script est lancé directement en root)
-SUDO_REAL_USER="${SUDO_USER:-}"
-[ "$SUDO_REAL_USER" = "root" ] && SUDO_REAL_USER=""
-ADMIN_USER="${ADMIN_USER:-$SUDO_REAL_USER}"
+# Utilisateur courant derrière root : celui qui a lancé sudo, sinon celui de la
+# session de connexion (logname, utile après « su - »). Vide si on ne trouve que
+# root (connexion directe en root).
+current_user() {
+  local u="${SUDO_USER:-}"
+  if [ -z "$u" ] || [ "$u" = "root" ]; then
+    u="$(logname 2>/dev/null || true)"
+  fi
+  [ "$u" = "root" ] && u=""
+  echo "$u"
+}
+ADMIN_USER_GIVEN="${ADMIN_USER:-}"
+ADMIN_USER="${ADMIN_USER:-$(current_user)}"
 SSH_PUBKEY="${SSH_PUBKEY:-}"
 SSH_PUBKEY_FILE="${SSH_PUBKEY_FILE:-}"
 SUDO_NOPASSWD="${SUDO_NOPASSWD:-0}"
@@ -1400,6 +1410,13 @@ main() {
       ;;
   esac
   need_root
+  if [ -z "$ADMIN_USER_GIVEN" ]; then
+    if [ -n "$ADMIN_USER" ]; then
+      log "ADMIN_USER non défini : utilisation de l'utilisateur courant « $ADMIN_USER »"
+    else
+      warn "ADMIN_USER non défini et aucun utilisateur courant autre que root : les étapes qui configurent un utilisateur s'arrêteront (indique ADMIN_USER=...)."
+    fi
+  fi
   case "$cmd" in
     all)
       check_os
