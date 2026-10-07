@@ -589,9 +589,20 @@ write_vim_conf() {
   local file="$1" col="$2"
 
   [ -f "$file" ] && cp "$file" "${file}.bak.$(date +%F)"
-  cat > "$file" <<EOF
+  cat > "$file" <<'EOF'
+" ~/.vimrc — géré par bootstrap-node.sh
+"
+" Tout est dans « if 1 ... endif » : vim.tiny (version minimale de Debian, sans
+" +eval) IGNORE ce bloc au lieu d'afficher des dizaines d'erreurs E319. Les
+" variantes complètes (vim.nox, vim.basic) l'exécutent normalement.
+"
+" ATTENTION : pas de commentaire en fin de ligne après un map, cnoremap ou
+" command : Vim le prendrait pour la suite des touches de la commande.
+set nocompatible
+
+if 1
+
 " --- Base ---------------------------------------------------
-set nocompatible              " Mode Vim pur (pas de compatibilité vi)
 set encoding=utf-8            " Encodage interne UTF-8
 set hidden                    " Permet de changer de buffer sans sauvegarder
 set mouse=                    " Souris désactivée (la sélection du terminal reste utilisable)
@@ -606,11 +617,11 @@ set laststatus=2              " Barre d'état toujours visible
 set wildmenu                  " Complétion améliorée en mode commande
 
 " --- Couleurs et syntaxe -----------------------------------
-syntax on                     " Coloration syntaxique
-filetype plugin indent on     " Détection du type de fichier + indentation adaptée
+syntax on
+filetype plugin indent on
 set t_Co=256                  " Terminal 256 couleurs
 set background=dark           " Fond sombre
-colorscheme desert            " Thème desert
+silent! colorscheme desert
 
 " --- Indentation --------------------------------------------
 set expandtab                 " Tabulation -> espaces
@@ -624,23 +635,30 @@ set incsearch                 " Recherche incrémentale (pendant la frappe)
 set hlsearch                  " Surligne les résultats
 set ignorecase                " Insensible à la casse...
 set smartcase                 " ...sauf si la recherche contient une majuscule
-nnoremap <silent> <Esc><Esc> :nohlsearch<CR>   " Double Echap = efface le surlignage
+" Double Échap : efface le surlignage de la recherche
+nnoremap <silent> <Esc><Esc> :nohlsearch<CR>
 
 " --- Copier / coller ----------------------------------------
-" Note : vim-nox est compilé SANS +clipboard, donc "+y ne marche pas.
-" On passe par xclip (sudo apt install xclip) ; sous Wayland, remplacer par wl-copy / wl-paste.
-set pastetoggle=<F2>          " F2 : mode paste (évite l'auto-indentation en collant du texte)
-vnoremap <leader>y :w !xclip -selection clipboard<CR><CR>   " \y en visuel : copie vers le presse-papier système
-nnoremap <leader>p :r !xclip -selection clipboard -o<CR>    " \p : colle le presse-papier système sous le curseur
+" vim-nox est compilé SANS +clipboard : "+y ne marche pas, on passe par xclip
+" (sous Wayland, remplacer par wl-copy / wl-paste).
+" F2 : mode paste (évite l'auto-indentation en collant du texte)
+set pastetoggle=<F2>
+" \y en mode visuel : copie la sélection vers le presse-papiers système
+vnoremap <leader>y :w !xclip -selection clipboard<CR><CR>
+" \p : colle le presse-papiers système sous le curseur
+nnoremap <leader>p :r !xclip -selection clipboard -o<CR>
 
 " --- Caractères spéciaux ------------------------------------
 set listchars=tab:»·,trail:·,eol:¬,nbsp:␣,extends:>,precedes:<
-nnoremap <F3> :set list!<CR>  " F3 : affiche/masque tabs, espaces de fin, fins de ligne
-nnoremap <leader>w :set wrap!<CR>   " \w : bascule le retour à la ligne
+" F3 : affiche/masque tabulations, espaces de fin et fins de ligne
+nnoremap <F3> :set list!<CR>
+" \w : bascule le retour à la ligne
+nnoremap <leader>w :set wrap!<CR>
 
 " --- Sudo à l'écriture --------------------------------------
-cnoremap w!! w !sudo tee % >/dev/null<CR>:e!<CR>   " :w!! sauvegarde avec sudo (fichier ouvert sans droits)
-command! W execute 'w !sudo tee % > /dev/null' <bar> edit!   " :W fait la même chose
+" :w!! et :W sauvegardent avec sudo un fichier ouvert sans les droits
+cnoremap w!! w !sudo tee % >/dev/null<CR>:e!<CR>
+command! W execute 'w !sudo tee % > /dev/null' <bar> edit!
 
 " --- Confort ------------------------------------------------
 set undofile                  " Historique d'annulation persistant
@@ -649,13 +667,31 @@ set backspace=indent,eol,start " Backspace fonctionne partout
 set nobackup noswapfile       " Pas de fichiers ~ ni .swp (à retirer si tu préfères la sécurité)
 set history=1000              " Historique de commandes plus long
 set splitright splitbelow     " Les nouveaux splits s'ouvrent à droite / en bas
-set virtualedit=block   " Permet de placer le curseur au-delà de la fin des lignes en mode bloc
+set virtualedit=block         " Curseur au-delà de la fin des lignes en mode bloc
 
-" Supprimer les espaces de fin de ligne avec F4
+" F4 : supprime les espaces de fin de ligne
 nnoremap <F4> :%s/\s\+$//e<CR>:nohlsearch<CR>
 
+endif
 EOF
+}
 
+# Éditeur de crontab -e, visudo, git... : sensible-editor lit d'abord EDITOR et
+# VISUAL, puis ~/.selected_editor (sinon il fait choisir, souvent vim.tiny).
+# On y écrit la variante complète de Vim. « sudo crontab -e » ne transmet pas
+# EDITOR : c'est le ~/.selected_editor de root qui compte, d'où les deux.
+preferred_vim() {
+  local v
+  for v in /usr/bin/vim.nox /usr/bin/vim.basic /usr/bin/vim; do
+    if [ -x "$v" ]; then echo "$v"; return 0; fi
+  done
+  echo /usr/bin/editor
+}
+
+write_selected_editor() {
+  local file="$1"
+  printf '# Généré par bootstrap-node.sh (format de select-editor)\nSELECTED_EDITOR="%s"\n' \
+    "$(preferred_vim)" > "$file"
 }
 
 
@@ -733,6 +769,11 @@ export HISTFILESIZE=100000
 export HISTCONTROL=ignoreboth:erasedups
 shopt -s histappend checkwinsize
 
+# Éditeur par défaut (crontab -e, git, less v...) : Vim complet
+if command -v vim >/dev/null 2>&1; then
+  export EDITOR=vim VISUAL=vim
+fi
+
 # Alias
 alias ll='ls -alFh --color=auto'
 alias la='ls -A --color=auto'
@@ -749,6 +790,23 @@ if command -v starship >/dev/null 2>&1; then
   unset -f __lab_prompt 2>/dev/null || true
   PROMPT_COMMAND=""
   eval "$(starship init bash)"
+fi
+
+# Souris : un programme qui suit la souris (tmux, vim, Claude...) l'active dans le
+# terminal et la désactive en sortant. S'il meurt sans le faire (connexion SSH
+# coupée, kill), le terminal ou le panneau tmux continue d'envoyer chaque
+# mouvement au shell, qui affiche des « 35;33;42M ». On désactive donc ces modes
+# à chaque prompt : le shell n'en a jamais besoin, et les programmes les
+# réactivent eux-mêmes au démarrage.
+__lab_reset_mouse() {
+  [ -t 1 ] && printf '\e[?1000l\e[?1002l\e[?1003l\e[?1005l\e[?1006l\e[?1015l'
+  return 0
+}
+if command -v starship >/dev/null 2>&1; then
+  # Point d'extension prévu par Starship, appelé avant chaque prompt
+  starship_precmd_user_func="__lab_reset_mouse"
+else
+  PROMPT_COMMAND="__lab_reset_mouse${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 fi
 
 # Ouvre ou reprend la session tmux « main » à la connexion SSH (si activé)
@@ -813,7 +871,8 @@ step_shell() {
     install_tmux_plugins "$u" "$home"
     install -d -o "$u" -g "$grp" -m 755 "$home/.vim" "$home/.vim/undo"
     write_vim_conf "$home/.vimrc" "$col"
-    chown "$u:$grp" "$home/.vimrc"
+    write_selected_editor "$home/.selected_editor"
+    chown "$u:$grp" "$home/.vimrc" "$home/.selected_editor"
     find "$home" -maxdepth 1 -name '.vimrc.bak.*' -exec chown "$u:$grp" {} +
     install -d -o "$u" -g "$grp" -m 755 "$home/.config"
     chown "$u:$grp" "$home/.config"
