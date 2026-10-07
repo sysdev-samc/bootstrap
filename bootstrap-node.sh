@@ -13,7 +13,8 @@
 #              Ansible base : outils d'exploitation, bash, Git, pager, cron et
 #              permissions système. Aucun mot de passe root n'est défini.
 #   dev        Installe les outils de développement interactifs (fzf, zoxide,
-#              direnv, bat, fd) pour l'utilisateur d'administration.
+#              direnv, bat, fd) pour l'utilisateur d'administration et root
+#              (Ctrl-R : historique avec recherche floue).
 #   user       Crée l'utilisateur d'administration, membre du groupe sudo, et
 #              installe ta clé publique SSH.
 #   ssh        Durcit sshd (root interdit, mot de passe interdit SI une clé est
@@ -263,14 +264,10 @@ base() {
 # dev — environnement interactif de développement pour un utilisateur
 # -----------------------------------------------------------------------------
 dev() {
-  local home grp devrc bashrc tmp
+  local home grp devrc bashrc tmp u
   require_dev_user
-  home="$(get_home "$DEV_USER")"
-  grp="$(id -gn "$DEV_USER")"
-  bashrc="$home/.bashrc"
-  devrc="$home/.bash_dev"
 
-  log "Installation de l'environnement de développement pour $DEV_USER"
+  log "Installation de l'environnement de développement pour $DEV_USER et root"
   apt-get update -y
   apt-get install -y fzf zoxide direnv bat fd-find
 
@@ -303,14 +300,20 @@ if ! command -v fd >/dev/null 2>&1 && command -v fdfind >/dev/null 2>&1; then
   alias fd='fdfind'
 fi
 EOF
-  install -o "$DEV_USER" -g "$grp" -m 644 "$tmp" "$devrc"
+  for u in "$DEV_USER" root; do
+    home="$(get_home "$u")"
+    grp="$(id -gn "$u")"
+    bashrc="$home/.bashrc"
+    devrc="$home/.bash_dev"
+    install -o "$u" -g "$grp" -m 644 "$tmp" "$devrc"
+    touch "$bashrc"
+    if ! grep -qF '.bash_dev' "$bashrc"; then
+      printf '\n# Outils de développement\n[ -f "$HOME/.bash_dev" ] && . "$HOME/.bash_dev"\n' >> "$bashrc"
+    fi
+    chown "$u:$grp" "$bashrc"
+    log "Configuration écrite dans $devrc"
+  done
   rm -f "$tmp"
-  touch "$bashrc"
-  if ! grep -qF '.bash_dev' "$bashrc"; then
-    printf '\n# Outils de développement\n[ -f "$HOME/.bash_dev" ] && . "$HOME/.bash_dev"\n' >> "$bashrc"
-  fi
-  chown "$DEV_USER:$grp" "$bashrc"
-  log "Configuration écrite dans $devrc"
   warn "Ouvre une nouvelle session pour activer fzf, zoxide et direnv."
 }
 
